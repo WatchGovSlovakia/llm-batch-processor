@@ -1,0 +1,18 @@
+# Editor swap/backup files
+*.swp
+*.swo
+*~
+.*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Env
+.env
