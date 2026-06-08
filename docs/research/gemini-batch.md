@@ -332,6 +332,136 @@ litellm automatically tracks costs for Vertex AI Gemini models using the correct
 
 ---
 
+## 10. Batch Cancellation: Cost, Latency, Tooling
+
+### Cancellation API & State Transitions
+
+**API Method:** `projects.locations.batchPredictionJobs.cancel`
+- **Endpoint:** POST `https://{service-endpoint}/v1/{name}:cancel`
+- **Parameter:** Resource name in format `projects/{project}/locations/{location}/batchPredictionJobs/{batchPredictionJob}`
+- **Request body:** Empty JSON object
+- **Response:** Empty JSON object on success
+
+**State Transitions:**
+- On cancellation request: job transitions to `JOB_STATE_CANCELLING` 
+- On successful cancellation: job transitions to `CANCELLED`
+- **Important caveat:** Server makes "best effort" to cancel — **success is not guaranteed**. If a job completes before cancellation takes effect, it will complete normally rather than being cancelled. Clients must check job state via `GetBatchPredictionJob` to verify actual cancellation status.
+
+**Sources:** [Method: batchPredictionJobs.cancel](https://docs.cloud.google.com/vertex-ai/docs/reference/rest/v1/projects.locations.batchPredictionJobs/cancel), [Cancel a batch prediction job sample](https://docs.cloud.google.com/vertex-ai/docs/samples/aiplatform-cancel-batch-prediction-job-sample)
+
+### Cancellation Latency
+
+**Documented latency:** No specific latency bound documented. The cancellation is **asynchronous**, meaning the API returns immediately, but the job's actual state transition to CANCELLED may take additional time server-side.
+
+**Practical guidance:** Clients should poll `GetBatchPredictionJob` periodically (every few minutes) to detect state transitions. No SLA or guaranteed upper bound is published.
+
+**Implication for "submit then cancel if deadline nears" pattern:** You must account for unknown cancellation latency when deciding when to issue the cancellation request — a job might complete between your cancellation request and the state transition actually taking effect.
+
+**Sources:** [Method: batchPredictionJobs.cancel](https://docs.cloud.google.com/vertex-ai/docs/reference/rest/v1/projects.locations.batchPredictionJobs/cancel)
+
+### Billing on Cancellation
+
+**Pay-for-what-was-processed model:** You are **charged only for completed requests** (those returning HTTP 200 status). Unprocessed or failed requests (4xx, 5xx) are **not charged**.
+
+**On cancellation:** When you cancel a batch job, any remaining work is cancelled, and you pay **only for completed requests** that have already been processed up to the cancellation point. You are **not charged** for:
+- Requests queued but not yet processed
+- Requests that were in-flight when cancellation took effect
+- Any "speculative" or failed processing
+
+**Per-token model:** For Gemini models on Vertex batch, billing is per-token (input and output tokens) for successfully completed requests. The 50% batch discount applies to all tokens in completed requests.
+
+**No cancellation fee:** Google Cloud does not charge an additional fee or penalty for cancelling a job.
+
+**Implications:**
+- ✅ Cancellation itself is free (no API fee)
+- ✅ You pay only for what was actually processed
+- ⚠️ If a job nearly completes (due to latency in cancellation taking effect), you may pay for nearly all requests — cancellation is not guaranteed to stop processing mid-batch
+- ⚠️ For a deadline-based pattern, you must cancel *significantly* before your deadline to account for unknown cancellation latency
+
+**Sources:** [Batch inference with Gemini](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/multimodal/batch-prediction-gemini), [Batch Predictions Overview](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/maas/capabilities/batch-prediction)
+
+### Abandoned Job Cost
+
+If you submit a batch job and let it run to completion (never cancel), you pay for **all successfully processed requests** at the per-token rate (with batch discount applied). Incomplete jobs that exceed 24 hours are automatically cancelled by Google, and you still pay only for what was completed before the auto-cancellation.
+
+### GCS Storage Cost During Batch Wait
+
+**Storage location (Vertex AI path):** Input and output files are stored in your own GCS bucket that you provide.
+
+**Cost:** You pay standard GCS storage rates (typically **$0.020/GB/month** for Standard tier in US regions) for the duration the files sit in the bucket.
+
+**Negligibility for small batches:** For a small batch (e.g., 5 MB JSONL input + 10 MB results = 15 MB total) queued for 1 day:
+- 15 MB = 0.015 GB
+- Cost = 0.015 GB × ($0.020 / month) × (1 day / 30 days) ≈ **$0.00001** (0.001 cents)
+- This is **negligible** for short turnaround times (hours to a day)
+
+**For longer waits:** Storage cost becomes material only if files remain in the bucket for weeks or months without cleanup. For example, 100 GB sitting for 30 days = $2 storage cost, plus GCS operation costs (writes, reads, deletes).
+
+**Best practice:** Delete input/output files from GCS after job completion and result retrieval to avoid unnecessary storage charges.
+
+**Sources:** [Batch Data Storage section (earlier in this document)](#9-batch-data-storage-retention--cleanup), [Google Cloud Storage Pricing](https://cloud.google.com/storage/pricing)
+
+### litellm Support for Batch Cancellation
+
+**Status:** litellm **has** a `cancel_batch()` method, **but it does NOT support the `vertex_ai` provider**.
+
+**Current support:** The `cancel_batch()` function signature includes a type hint for `vertex_ai`, but the implementation only handles `"openai"` and `"azure"` providers (OpenAI-compatible APIs).
+
+```python
+# litellm signature (supports openai, azure only)
+cancel_batch(
+    batch_id: str,
+    model: str = "",
+    custom_llm_provider: Union[Literal["openai", "azure", "vertex_ai"], str] = "openai",
+    ...
+)
+# Note: vertex_ai is in the type hint but not implemented
+```
+
+**Workaround:** To cancel a Vertex AI batch via litellm, you have two options:
+
+1. **Use litellm's passthrough endpoint:**
+   ```bash
+   curl -X POST "http://localhost:4000/v1/projects/your-project/locations/us-central1/batchPredictionJobs/job-id:cancel" \
+     -H "Authorization: Bearer your-api-key"
+   ```
+   This bypasses the `cancel_batch()` method and hits the Vertex AI REST API directly through litellm's proxy.
+
+2. **Use Vertex AI SDK directly:**
+   ```python
+   from google.cloud import aiplatform
+   client = aiplatform.gapic.JobServiceClient()
+   client.cancel_batch_prediction_job(name="projects/.../batchPredictionJobs/job-id")
+   ```
+   Drop down to the native Vertex AI client library to cancel jobs.
+
+**Sources:** [litellm batches/main.py](https://github.com/BerriAI/litellm/blob/main/litellm/batches/main.py), [litellm Vertex Batch APIs](https://docs.litellm.ai/docs/providers/vertex_batch), [liteLLM passthrough endpoint](https://docs.litellm.ai/docs/vertex_batch_passthrough)
+
+### Summary: Is "Submit Then Cancel If Deadline Nears" Essentially Free?
+
+**Answer: YES, with important caveats on timing and cost structure.**
+
+**Costs:**
+- ✅ **Cancellation itself:** Free (no API fee or penalty)
+- ✅ **GCS storage:** Negligible for small batches held for hours/days (sub-cent)
+- ⚠️ **Processed tokens:** You pay for what was already processed before cancellation took effect — this is not free, but it's bounded by "actual work done"
+
+**Latency & Guarantee:**
+- ⚠️ **No latency bound:** Cancellation is asynchronous with no documented completion time. A job can race to completion before cancellation takes effect, resulting in full processing charges.
+- ⚠️ **Best-effort only:** Server may not cancel the job if it completes first.
+
+**Recommendation for deadline-based pattern:**
+1. **Set a cancellation deadline well ahead of your hard deadline** (e.g., if you need results by T+12h, issue cancellation request at T+10h to account for cancellation latency)
+2. **Poll job state after cancellation** to verify state transitioned to CANCELLED
+3. **Accept that you'll pay for tokens processed up to the actual cancellation point** — the cost is not zero, but it is bounded by "work in progress"
+4. **For litellm users:** Use Vertex AI SDK directly or the passthrough endpoint; `litellm.cancel_batch()` does not support vertex_ai
+
+**Bottom line:** The pattern is operationally viable if you can tolerate uncertainty in cancellation latency and accept paying for partial batch processing. The storage cost is negligible for typical batch durations. The main risk is misjudging when to cancel (job might complete anyway), not hidden charges.
+
+**Sources:** [Method: batchPredictionJobs.cancel](https://docs.cloud.google.com/vertex-ai/docs/reference/rest/v1/projects.locations.batchPredictionJobs/cancel), [Batch inference with Gemini](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/multimodal/batch-prediction-gemini), [litellm batches/main.py](https://github.com/BerriAI/litellm/blob/main/litellm/batches/main.py)
+
+---
+
 ## References
 
 - [Gemini API Batch API Documentation](https://ai.google.dev/gemini-api/docs/batch-api)
@@ -347,3 +477,7 @@ litellm automatically tracks costs for Vertex AI Gemini models using the correct
 - [Zero Data Retention (ZDR) Documentation](https://ai.google.dev/gemini-api/docs/zdr)
 - [Batch API Pricing Issue Discussion](https://discuss.ai.google.dev/t/batch-api-charged-at-regular-api-prices-instead-of-discounted-batch-pricing/109621)
 - [Retention Period Discussion - Batch Mode](https://discuss.ai.google.dev/t/retention-period-and-storage-region-of-input-output-data-in-gemini-api-batch-mode/112404)
+- [Method: batchPredictionJobs.cancel](https://docs.cloud.google.com/vertex-ai/docs/reference/rest/v1/projects.locations.batchPredictionJobs/cancel)
+- [Cancel a batch prediction job sample](https://docs.cloud.google.com/vertex-ai/docs/samples/aiplatform-cancel-batch-prediction-job-sample)
+- [Google Cloud Storage Pricing](https://cloud.google.com/storage/pricing)
+- [litellm batches/main.py source](https://github.com/BerriAI/litellm/blob/main/litellm/batches/main.py)

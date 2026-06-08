@@ -118,6 +118,8 @@ The library never needs to know how many steps remain. It only ever asks *"room 
 
 If neither `deadline` nor `time_budget_hours` is set, batch mode never falls back.
 
+> **Note — this is the `conservative` fallback strategy, and the only one in the MVP.** Its margin must cover the worst-case batch turnaround (up to 24–48h), so it forgoes the discount on jobs submitted within a day or two of the deadline. A more aggressive `speculative` strategy — submit optimistically, then cancel and re-run interactively only at the last responsible moment — is **deferred to Phase 2**; it needs per-provider cancellation (litellm can't cancel Vertex/Anthropic) and more testing. Design captured in `docs/todo/2026-06-08-canceling-batch-jobs.md`. (Research confirmed submit-then-cancel is essentially free across all three providers.)
+
 ## 5. Storage
 
 ### 5.1 Pluggable backend interface
@@ -340,6 +342,7 @@ tests/
 - A `GitStorage` backend, if a caller ever wants library-managed git despite the commit-chatter cost.
 - Provider-side cleanup beyond Vertex/OpenAI if new providers expose billable batch storage.
 - Async concurrency on the interactive fallback path (instructor/Mirascope-style), only if interactive bursts become a bottleneck.
+- **Speculative batch with late cancellation** (`fallback_strategy="speculative"`) — submit optimistically, cancel + re-run interactively only when the deadline forces it, dropping the effective margin from ~24–48h to ~1.5–2h. Deferred to Phase 2; full design in `docs/todo/2026-06-08-canceling-batch-jobs.md`.
 
 ## 17. Prior Art and Borrowed Ideas
 

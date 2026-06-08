@@ -470,6 +470,141 @@ This prevents quota exhaustion, improves account hygiene, and follows OpenAI's i
 
 ---
 
-**Document Generated:** June 7, 2026  
-**Research Scope:** OpenAI Batch API (Delayed/Asynchronous Processing)  
-**Confidence Level:** High—based on official OpenAI documentation and litellm docs
+---
+
+## Batch Cancellation: Cost, Latency, Tooling
+
+### 1. Can You Cancel an In-Progress Batch?
+
+**Yes.** OpenAI's Batch API supports batch cancellation via a dedicated endpoint:
+
+**Endpoint:** `POST /v1/batches/{batch_id}/cancel`
+
+**State Transitions:** When you initiate cancellation, the batch transitions through two states:
+1. `cancelling` – Initial state after cancellation is requested.
+2. `cancelled` – Final state after all in-flight requests are safely terminated.
+
+According to the [Batch API documentation](https://developers.openai.com/docs/api-reference/batch/cancel), "The batch will be in status `cancelling` for up to 10 minutes, before changing to `cancelled`." This means **the batch can remain in the `cancelling` state for up to 10 minutes** while OpenAI gracefully stops in-flight API calls.
+
+(Source: [Cancel a batch | OpenAI API Reference](https://developers.openai.com/docs/api-reference/batch/cancel))
+
+---
+
+### 2. Cancellation Latency
+
+**Up to 10 minutes.** According to OpenAI's official documentation, after you submit a cancellation request, the batch status transitions to `cancelling` and remains in that state for **up to 10 minutes** while in-flight requests are terminated. After that period, the status becomes `cancelled`.
+
+**Practical Implication:** If you submit a batch optimistically and want to cancel it to re-run interactively before a deadline, you need to account for up to a 10-minute latency window. If your deadline is tight (e.g., <10 minutes), batch cancellation may not meet your latency requirements.
+
+(Source: [Batch API | OpenAI API](https://developers.openai.com/api/docs/guides/batch))
+
+---
+
+### 3. Billing When Cancelling
+
+**Principle: You pay only for completed work.** When you cancel a batch:
+
+- **Completed requests are charged.** Any requests that finished before cancellation is initiated will be billed at the 50% batch discount rate.
+- **In-flight/cancelled requests are NOT charged.** Requests that were in progress or not yet started when cancellation was requested will not incur any token charges.
+- **No cancellation fee.** There is no additional charge, penalty, or fee for initiating cancellation—you are only charged for tokens from successfully completed requests.
+
+This is explicitly stated in the OpenAI documentation: "You will be charged for tokens consumed from any completed requests." Unfinished requests receive an error and do not incur charges.
+
+(Source: [Batch API | OpenAI API](https://developers.openai.com/api/docs/guides/batch))
+
+---
+
+### 4. Abandoned/Expired Batch Cost
+
+**Same principle: pay for completed work only.** If you do not explicitly cancel a batch and it expires after 24 hours, the result is identical from a billing perspective:
+
+- **Completed requests are charged.** Requests that finished before the 24-hour window closed are billed at the batch 50% discount rate.
+- **Expired requests are NOT charged.** Requests that did not finish within the 24-hour SLA window receive an error ("This request could not be executed before the completion window expired") and are not billed.
+
+**No cost difference between cancellation and expiration.** Whether you proactively cancel or let a batch expire naturally, you pay only for work that actually completed.
+
+(Source: [Batch API | OpenAI API](https://developers.openai.com/api/docs/guides/batch))
+
+---
+
+### 5. Storage Cost During Wait
+
+**Zero storage cost.** OpenAI **does not charge** a per-file or per-GB-per-day storage fee for batch input files, output files, or error files while they sit in queue or in-progress. 
+
+Each project has a **2.5 TB file storage quota** (a limit on total stored files, not a cost-based quota), but quota exhaustion is the only practical concern—not billing. As documented in the research section [Batch Data Storage, Retention & Cleanup](#batch-data-storage-retention--cleanup), batch files incur no storage charges.
+
+(Source: [Pricing | OpenAI API](https://developers.openai.com/api/docs/pricing); [File storage quota errors | OpenAI Help Center](https://help.openai.com/en/articles/8724843-file-storage-quota-errors-for-api-users))
+
+---
+
+### 6. LiteLLM Batch Cancellation Support
+
+**Yes, fully supported.** LiteLLM exposes batch cancellation via two functions (sync and async) available at the top level:
+
+#### Async Function (Recommended)
+
+```python
+import litellm
+
+response = await litellm.acancel_batch(
+    batch_id="batch-abc123...",
+    custom_llm_provider="openai"  # or "azure", "vertex_ai"
+)
+```
+
+**Signature:**
+```python
+async def acancel_batch(
+    batch_id: str,
+    model: Optional[str] = None,
+    custom_llm_provider: Literal["openai", "azure", "vertex_ai"] = "openai",
+    metadata: Optional[Dict[str, str]] = None,
+    **kwargs
+) -> CancelBatchResponse
+```
+
+#### Sync Function (Alternative)
+
+```python
+response = litellm.cancel_batch(
+    batch_id="batch-abc123...",
+    custom_llm_provider="openai"
+)
+```
+
+**Signature:**
+```python
+def cancel_batch(
+    batch_id: str,
+    model: Optional[str] = None,
+    custom_llm_provider: Union[Literal["openai", "azure", "vertex_ai"], str] = "openai",
+    metadata: Optional[Dict[str, str]] = None,
+    **kwargs
+) -> CancelBatchResponse
+```
+
+**LiteLLM Equivalent:** Both functions execute `POST /v1/batches/{batch_id}/cancel` (as documented in the source: "LiteLLM Equivalent of POST https://api.openai.com/v1/batches/{batch_id}/cancel").
+
+**Multi-Provider Support:** LiteLLM also supports batch cancellation for Azure and Vertex AI via the same interface—just change the `custom_llm_provider` parameter.
+
+(Source: [litellm/batches/main.py](https://github.com/BerriAI/litellm/blob/main/litellm/batches/main.py), lines 898–1103; [LiteLLM Batches Documentation](https://docs.litellm.ai/docs/batches))
+
+---
+
+### Summary: Is Submit-Then-Cancel Essentially Free?
+
+**Yes, with important caveats:**
+
+1. **Cost:** Cancellation itself has no fee. You pay only for requests that completed before cancellation—any partially processed or queued requests are free. For a "submit then cancel immediately" pattern, your cost is negligible (roughly the cost of validation/early processing only).
+
+2. **Latency:** Cancellation takes **up to 10 minutes** to fully take effect (time for the batch to transition from `cancelling` to `cancelled`). If your deadline is tighter than 10 minutes, this pattern may not work. However, you can query the batch status immediately after requesting cancellation and proceed with alternative logic once cancellation is confirmed.
+
+3. **LiteLLM Support:** Yes, `litellm.acancel_batch()` and `litellm.cancel_batch()` are fully supported with simple function signatures. Use `custom_llm_provider="openai"` for the OpenAI Batch API.
+
+**Practical Recommendation:** The pattern is suitable if your deadline buffer is >10 minutes. Combine it with polling (`aretrieve_batch()`) to detect cancellation completion and trigger fallback logic (e.g., interactive request processing) as soon as the batch is cancelled. This allows you to "optimistically submit, then gracefully exit if time runs out" with minimal cost penalty.
+
+---
+
+**Document Generated:** June 8, 2026  
+**Research Scope:** OpenAI Batch API (Delayed/Asynchronous Processing) + Cancellation  
+**Confidence Level:** High—based on official OpenAI documentation, OpenAI API Reference, and litellm source code

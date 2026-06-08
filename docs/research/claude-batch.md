@@ -493,6 +493,133 @@ From official docs: _"This feature is **not** eligible for [Zero Data Retention 
 
 ---
 
+## Batch Cancellation: Cost, Latency, Tooling
+
+### 1. Can You Cancel an In-Progress Batch?
+
+**Yes.** Cancellation is fully supported via:
+
+- **Endpoint:** `POST /v1/messages/batches/{message_batch_id}/cancel` ([Cancel a Message Batch - Claude API Reference](https://platform.claude.com/docs/en/api/canceling-message-batches))
+- **Native SDKs:** Anthropic Python SDK: `client.messages.batches.cancel(message_batch_id)` or `client.beta.messages.batches.cancel(message_batch_id)`
+- **Status transitions:** 
+  - Immediately after cancel call: `processing_status` becomes `"canceling"`
+  - When cancellation finalizes: `processing_status` becomes `"ended"`
+  - Per-request result types remain: `"succeeded"`, `"errored"`, `"canceled"`, `"expired"` (tracked in `request_counts`)
+  - A `cancel_initiated_at` field (RFC 3339 datetime) is populated on the batch object
+
+**Key behavior:** The batch enters a `canceling` state, but "cancellation may not take immediate effect." The system may complete any **non-interruptible, in-progress requests** before finalizing cancellation. This means a partial result set is typical — requests already sent to the model may finish before cancellation is finalized. ([Cancel a Message Batch - Claude API Reference](https://platform.claude.com/docs/en/api/canceling-message-batches))
+
+---
+
+### 2. Cancellation Latency
+
+**No quantified SLA is published.** Anthropic's documentation states:
+
+- Cancellation initiates immediately (status changes to `"canceling"`)
+- **The system may complete any in-progress, non-interruptible requests before finalizing cancellation**
+- No explicit timeout or latency guarantee is documented
+
+**Best practice:** Poll the batch status (`GET /v1/messages/batches/{message_batch_id}`) until `processing_status == "ended"`. Most cancellations likely complete within seconds to minutes, but Anthropic does not publish a numeric latency target. The longest latency would be bound by the longest in-flight request's remaining execution time.
+
+**Source:** [Cancel a Message Batch - Claude API Reference](https://platform.claude.com/docs/en/api/canceling-message-batches)
+
+---
+
+### 3. Billing on Cancel: Token Charges & Costs
+
+**Billing is based on result type:**
+
+| Result Type | Billed? | Notes |
+|---|---|---|
+| `succeeded` | ✅ Yes | Full token cost (input + output tokens) charged |
+| `errored` | ❌ No | "You will not be billed for these requests" |
+| `canceled` | ❌ No | "User canceled the batch before this request could be sent to the model. You will not be billed for these requests." |
+| `expired` | ❌ No | "Batch reached its 24 hour expiration before this request could be sent to the model. You will not be billed for these requests." |
+
+**Cancellation fee:** None. No separate charge for initiating cancellation.
+
+**Key implication for "submit then cancel" pattern:** You pay **only for requests that successfully reached the model and produced output** (i.e., `result.type == "succeeded"`). Requests canceled before processing begins incur **zero charge**. However, requests already in progress when cancellation is initiated may complete and be charged — cancellation cannot interrupt them mid-execution.
+
+**Source:** [Batch processing - Claude Docs](https://platform.claude.com/docs/en/docs/build-with-claude/batch-processing) — request result types and billing table
+
+---
+
+### 4. Abandoned/Expired Batch Cost
+
+If you **let a batch expire** (do not retrieve results within 24 hours), the same billing rule applies:
+
+- **Expired requests are NOT billed.** Per-request result type `"expired"` means "Batch reached its 24 hour expiration before this request could be sent to the model. You will not be billed for these requests."
+- You are charged only for requests that reached `"succeeded"` before the 24-hour deadline.
+- **No expiration fee:** There is no penalty or extra charge for allowing results to expire.
+- **Result retention:** Results remain accessible for **29 days** after batch creation (not from processing completion), but can only be retrieved if accessed before the batch `expires_at` timestamp (24 hours).
+
+**Source:** [Batch processing - Claude Docs](https://platform.claude.com/docs/en/docs/build-with-claude/batch-processing)
+
+---
+
+### 5. Storage Cost During the Wait
+
+**Zero storage charge.** Anthropic's Batch API uses **inline request submission** (no uploaded JSONL file):
+
+- Requests are submitted directly in the `requests` array of the create-batch payload
+- **No separate file storage object** is created (unlike OpenAI)
+- **No storage cost** is documented — all costs are token-based (50% discount applies uniformly)
+- Results are stored server-side for 24 hours (processing window) and remain accessible for 29 days (retention window), but no additional charge is incurred for this storage
+
+**Source:** [Batch processing - Claude Docs](https://platform.claude.com/docs/en/docs/build-with-claude/batch-processing#how-to-use-the-message-batches-api) and [Batch Data Storage, Retention & Cleanup](https://platform.claude.com/docs/en/docs/build-with-claude/batch-processing) (section 8.2 in this document)
+
+---
+
+### 6. litellm Support for Anthropic Batch Cancellation
+
+**⚠️ Current status (as of June 2026): litellm does NOT support `cancel_batch` for Anthropic.**
+
+**litellm's `cancel_batch` function signature:**
+
+```python
+def cancel_batch(
+    batch_id: str,
+    model: Optional[str] = None,
+    custom_llm_provider: Union[Literal["openai", "azure", "vertex_ai"], str] = "openai",
+    metadata: Optional[Dict[str, str]] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
+    extra_body: Optional[Dict[str, str]] = None,
+    **kwargs,
+) -> Union[LiteLLMBatch, Coroutine[Any, Any, LiteLLMBatch]]
+```
+
+**Supported providers:** `"openai"`, `"azure"`, `"vertex_ai"` only. **Anthropic is NOT in the literal types.**
+
+**Workaround:** Use the **Anthropic native Python SDK directly** for cancellation:
+```python
+import anthropic
+
+client = anthropic.Anthropic(api_key="YOUR_KEY")
+client.messages.batches.cancel(message_batch_id="msgbatch_...")
+```
+
+**Why the gap?** litellm has `create_batch()` and `retrieve_batch()` support for Anthropic (via `custom_llm_provider="anthropic_batches"`), but the `cancel_batch()` endpoint was not yet extended to Anthropic. This is a **known limitation** ([Anthropic Batches support + inline requests feature · BerriAI/litellm · Discussion #17280](https://github.com/BerriAI/litellm/discussions/17280)).
+
+**Source:** [litellm batches.py on GitHub](https://github.com/BerriAI/litellm/blob/main/litellm/batches/main.py) and [/batches - liteLLM Docs](https://docs.litellm.ai/docs/batches)
+
+---
+
+## Summary: Is "Submit Then Cancel If Deadline Nears" Essentially Free?
+
+**Answer: Mostly yes, with caveats.**
+
+✅ **Cost-free cancellation:** Initiating cancellation itself has no fee, and requests canceled before processing begins incur zero token charges.
+
+⚠️ **Partial billing risk:** Requests already executing when cancellation is initiated will complete and be charged at the 50% batch discount rate. Cancellation **cannot interrupt in-flight requests** — this is the main cost exposure.
+
+⏱️ **Latency:** Cancellation status changes immediately to `"canceling"`, but finalization (when `processing_status == "ended"`) depends on how many requests are mid-execution. Latency is typically fast (seconds to minutes) but **not quantified by Anthropic**.
+
+❌ **litellm gap:** litellm's `cancel_batch()` does not support Anthropic. Use the **native Anthropic SDK** (`client.messages.batches.cancel(...)`) instead.
+
+**Recommendation for library authors:** The pattern is viable for a "deadline-based fallback" (cancel if a deadline approaches and re-run interactively). The cost overhead is bounded to in-flight requests only, which should be a small fraction of total batch size. Deploy with monitoring on `cancel_initiated_at` vs. `succeeded` request counts to quantify actual cancellation overhead in your workload.
+
+---
+
 ## References
 
 - [Batch processing - Claude Docs](https://platform.claude.com/docs/en/build-with-claude/batch-processing)
@@ -500,7 +627,10 @@ From official docs: _"This feature is **not** eligible for [Zero Data Retention 
 - [Retrieve Message Batch results API Reference](https://platform.claude.com/docs/en/api/retrieving-message-batch-results)
 - [List Message Batches API Reference](https://platform.claude.com/docs/en/api/listing-message-batches)
 - [Delete a Message Batch - Claude API Reference](https://platform.claude.com/docs/en/api/deleting-message-batches)
+- [Cancel a Message Batch - Claude API Reference](https://platform.claude.com/docs/en/api/canceling-message-batches)
 - [Pricing - Claude API Docs](https://platform.claude.com/docs/en/about-claude/pricing)
 - [Rate Limits API - Claude API Docs](https://platform.claude.com/docs/en/manage-claude/rate-limits-api)
 - [API and data retention - Claude Docs](https://platform.claude.com/docs/en/manage-claude/api-and-data-retention)
 - [litellm Batches Documentation](https://docs.litellm.ai/docs/batches)
+- [Anthropic SDK Python - Batches API](https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/resources/beta/messages/batches.py)
+- [Anthropic Batches support + inline requests feature · BerriAI/litellm · Discussion #17280](https://github.com/BerriAI/litellm/discussions/17280)
