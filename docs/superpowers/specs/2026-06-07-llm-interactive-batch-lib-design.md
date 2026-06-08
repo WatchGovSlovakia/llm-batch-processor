@@ -40,7 +40,7 @@ A `Job` wraps one *or many* requests, a model, a mode, and a storage handle. The
 | Current state | `execute()` does | Returns |
 |---|---|---|
 | `NOT_SENT` | Interactive: call now, store result → `COMPLETED`. Batch: create batch, store `batch_job_id` → `SENT`. | result, or `None` (batch) |
-| `SENT` | Poll once. Completed → store result → `COMPLETED`. Still running → no change. Failed/expired → `FAILED`. | result, `None`, or raises |
+| `SENT` | Poll once. Completed → store result → `COMPLETED`. Still running (or transient poll error, §8.1) → no change. Provider `failed`/`expired` → `FAILED`. | result, `None`, or raises |
 | `COMPLETED` | Nothing (no API call). | stored result |
 | `FAILED` | Nothing. | raises `BatchJobFailed` |
 
@@ -112,7 +112,7 @@ if (deadline - now) < max_batch_turnaround_hours:
 ```
 
 - `deadline` — absolute timestamp by which all processing must be done. The caller computes it from domain knowledge, e.g. `deadline = legal_signup_deadline − reviewer_reading_time`. `time_budget_hours` is accepted as sugar (`deadline = pipeline_started_at + time_budget_hours`).
-- `max_batch_turnaround_hours` — conservative worst-case batch round duration (default **48**, configurable). Below this margin, batch is too risky.
+- `max_batch_turnaround_hours` — conservative worst-case batch round duration (default **24**, configurable). Below this margin, batch is too risky.
 
 The library never needs to know how many steps remain. It only ever asks *"room for one more batch round?"*. Once the budget tightens, **every** remaining step naturally flips to interactive — exactly the desired behavior for a multi-step pipeline approaching a hard deadline.
 
@@ -122,7 +122,7 @@ If neither `deadline` nor `time_budget_hours` is set, batch mode never falls bac
 
 ### 5.1 Pluggable backend interface
 
-A minimal interface (preserved from the prototype):
+A minimal interface (preserved from the prototype, with enumeration added for the poller):
 
 ```python
 class Storage(Protocol):
@@ -130,7 +130,12 @@ class Storage(Protocol):
     def save(self, data: dict) -> None: ...
     def get(self, key, default=None): ...
     def finish(self) -> None: ...         # delete / mark finished
+
+class StorageScanner(Protocol):          # backend-level, used by the Poller
+    def iter_jobs(self) -> Iterator[dict]: ...   # enumerate all persisted jobs
 ```
+
+The per-job `Storage` handle is what a `Job` holds. The Poller needs to *enumerate* every job in a state dir / table, which the per-job handle cannot do — so each backend also exposes a `StorageScanner` (`FileStorage` walks the state dir; `PostgresStorage` runs a `SELECT`). This mirrors LangGraph's separation between a per-thread checkpoint handle and the saver that lists across threads.
 
 ### 5.2 `FileStorage(dir)` — default
 
@@ -158,8 +163,12 @@ The prototype's `(conn, entity_id, task_type)` upsert model, for callers already
   "submitted_at": "2026-06-05T10:00:00Z",
   "completed_at": null,
   "deadline": "2026-06-11T10:00:00Z",
+  "actual_mode": "batch",
   "response": null,
+  "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+  "cost": {"charged_usd": 0.0, "interactive_usd": 0.0, "saved_usd": 0.0},
   "error_message": null,
+  "poll_attempts": 0,
   "rerun_cmd": "python continue.py doc_abc",
   "cleanup_provider_files": true
 }
@@ -169,6 +178,9 @@ The prototype's `(conn, entity_id, task_type)` upsert model, for callers already
 - `n_requests` lets the poller verify it received every result.
 - `input_file_id` / `output_file_id` are recorded so provider-side cleanup (§7) can run later.
 - `deadline` is persisted so the fallback decision survives across runs.
+- `actual_mode` records whether the job *actually* ran as `batch` or fell back to `interactive` (the requested `mode` may differ from what the deadline check chose at submit) — needed to attribute cost correctly.
+- `usage` / `cost` capture token usage and spend on completion (captured in the provider layer, §9). `cost.saved_usd` is the batch discount realized (`interactive_usd − charged_usd`), so savings are visible per job and can be aggregated per pipeline (`pipeline.cost_summary()`). Borrowed from `ai-batch`'s cost tracking; litellm already returns usage and exposes `litellm.completion_cost(...)`, so this is near-free.
+- `poll_attempts` counts poll cycles for backoff/diagnostics (see §8).
 
 States: `not_sent` → `sent` → `completed` | `failed`.
 
@@ -227,9 +239,20 @@ The poller treats any job stuck in `SENT` past `max_batch_age` (default **3 days
 
 ## 8. Failure Handling
 
+### 8.1 Transient vs. terminal errors
+
+A poll attempt failing is **not** the same as the job failing — a critical distinction borrowed from Prefect/Dagster retry semantics and Anthropic's polling guidance. The library separates two error classes:
+
+- **Transient** (network blip, timeout, HTTP 429/5xx during poll/submit): the job **stays in its current state** (`SENT` keeps polling, `NOT_SENT` retries submit). The poller retries on its next cycle with **exponential backoff** keyed off `poll_attempts`; nothing is marked `FAILED`. A transient error never loses a submitted batch.
+- **Terminal** (batch reported `failed`/`expired` by the provider, or a per-request error in the output): the job → `FAILED`.
+
+`providers.poll_batch()` returns one of `pending | completed | failed | transient_error` so this classification lives in the provider layer (§9), where each provider's error shapes are known.
+
+### 8.2 The `FAILED` state
+
 - `FAILED` is **sticky**: `execute()` on a failed job raises `BatchJobFailed` (carrying `batch_job_id` and the provider error) rather than silently retrying.
 - Re-submitting is an explicit `job.retry()` (resets to `NOT_SENT`).
-- **Bundle policy (MVP):** if any request in a batch errors, the whole job → `FAILED`, with per-`custom_id` detail in `error_message`. Per-request partial success is a noted future extension (§13), not MVP.
+- **Bundle policy (MVP):** if any request in a batch errors, the whole job → `FAILED`, with per-`custom_id` detail in `error_message`. Per-request partial success is a noted future extension (§16), not MVP.
 - Exit-code protocol (preserved from prototype, for cron): `0` done, `1` pending, `2` failed.
 
 ## 9. Provider Layer (litellm)
@@ -237,13 +260,16 @@ The poller treats any job stuck in `SENT` past `max_batch_age` (default **3 days
 `providers.py` isolates everything litellm/provider-specific behind a small interface so `Job` stays provider-agnostic:
 
 ```python
-def submit_batch(model, requests) -> BatchHandle      # build JSONL/inline, upload, create
-def poll_batch(handle) -> (status, results | None)    # 'pending'|'completed'|'failed'
-def complete(model, messages) -> str                  # interactive path
-def cleanup(handle) -> None                           # delete provider-side files (§7)
-def provider_of(model) -> str                         # model prefix → custom_llm_provider
+def submit_batch(model, requests, **kw) -> BatchHandle  # build JSONL/inline, upload, create
+def poll_batch(handle) -> PollResult                    # status + results + usage
+def complete(model, messages, **kw) -> CompletionResult # interactive path: text + usage
+def cleanup(handle) -> None                             # delete provider-side files (§7)
+def provider_of(model) -> str                           # model prefix → custom_llm_provider
 ```
 
+- `poll_batch` status is `pending | completed | failed | transient_error` (the last drives §8.1 retry/backoff rather than `FAILED`).
+- **Usage & cost capture:** `PollResult` / `CompletionResult` carry litellm's `usage`; the layer computes `cost.charged_usd` via `litellm.completion_cost(...)` and `cost.interactive_usd` as the same usage priced at the non-batch rate, so `saved_usd` is derivable. This populates the `usage`/`cost` state fields (§5.4).
+- **Structured-output passthrough:** `submit_batch` and `complete` accept and forward arbitrary litellm kwargs (`response_format`, `tools`, `temperature`, …). The library never parses structured output itself — it just hands callers the same knobs litellm exposes, so a "text → structured data" step can request JSON/Pydantic without the library taking a dependency. Borrowed-in-spirit from `instructor`/`ai-batch`, without the coupling.
 - JSONL is built one line per request, `custom_id = "req-0".."req-N"` (matches prototype).
 - Provider quirks surfaced by research live **only here**: Vertex-only batch for Gemini (the `gemini/` prefix has no litellm batch support), Anthropic's inline submission (no file object), OpenAI's file-upload flow.
 - `provider_of` maps e.g. `vertex_ai/gemini-2.5-flash → "vertex_ai"`, `gpt-4o → "openai"`, `claude-* → "anthropic"`.
@@ -289,7 +315,8 @@ tests/
 ## 13. Testing Strategy
 
 - **TDD with litellm fully mocked** — no network in unit tests.
-- Coverage: state-machine transitions (`not_sent→sent→completed`, `→failed`), `execute()` idempotency (two calls = one submit), interactive path, deadline-fallback math, single-vs-bundle results, `FileStorage` atomic + deterministic round-trip, poller de-dup + `rerun_cmd` dispatch (subprocess mocked), stale-job timeout, completion cleanup ordering (persist before delete), failure → `FAILED`.
+- Coverage: state-machine transitions (`not_sent→sent→completed`, `→failed`), `execute()` idempotency (two calls = one submit), interactive path, deadline-fallback math, single-vs-bundle results, `FileStorage` atomic + deterministic round-trip, `StorageScanner.iter_jobs()` enumeration, poller de-dup + `rerun_cmd` dispatch (subprocess mocked), stale-job timeout, completion cleanup ordering (persist before delete), failure → `FAILED`.
+- New-behavior coverage: **transient vs. terminal** classification (a mocked 429/timeout keeps state `SENT` and bumps `poll_attempts`, never flips `FAILED`; a provider `expired`/`failed` does), **cost/usage capture** (`saved_usd` computed from mocked litellm usage), and **structured-output kwarg passthrough** (asserts `response_format` reaches the litellm call on both batch and interactive paths).
 - **Live provider tests** are opt-in via an env var and skipped by default.
 
 ## 14. Interface Required by `pdf-to-text` (downstream consumer)
@@ -305,9 +332,26 @@ tests/
 - Job priorities or queues.
 - Parallel job execution (cron handles this by re-running the pipeline script).
 - Library-managed git (caller owns pull/commit/push).
+- **Adopting a workflow engine (Prefect, Dagster, Ray, llmq) as the runtime.** These pull in servers/clusters/queues that fight the "runs on GitHub Actions or a laptop, state in a git repo" constraint. We borrow their *patterns* (idempotency, backoff, cron polling) but not the dependencies. Stated here so it is not reconsidered later.
 
 ## 16. Future Extensions (noted, not MVP)
 
 - Per-request partial success for bundles (return `list[str | None]` with per-`custom_id` status).
 - A `GitStorage` backend, if a caller ever wants library-managed git despite the commit-chatter cost.
 - Provider-side cleanup beyond Vertex/OpenAI if new providers expose billable batch storage.
+- Async concurrency on the interactive fallback path (instructor/Mirascope-style), only if interactive bursts become a bottleneck.
+
+## 17. Prior Art and Borrowed Ideas
+
+No off-the-shelf library combines our core (transparent idempotent interactive↔batch switching + persistent resumable state + deadline-aware fallback). Full survey in `docs/research/existing-libs.md`. What this design deliberately borrows:
+
+| Source | Borrowed | Where |
+|---|---|---|
+| **litellm** | Multi-provider batch + interactive primitives, `completion_cost` | §9 (foundation) |
+| **LangGraph** | Pluggable checkpointer pattern; per-thread handle vs. cross-thread saver split | §5.1 (`Storage` + `StorageScanner`) |
+| **ai-batch** | Git-friendly JSON state files; per-job cost tracking | §5.2, §5.4 (`usage`/`cost`) |
+| **Prefect / Dagster** | Idempotent execution; transient-vs-terminal retry with backoff; cron polling | §8.1, §6.2 |
+| **instructor / ai-batch** | Structured-output ergonomics — exposed as kwarg passthrough, not a dependency | §9 |
+| **Ray Data** | Checkpoint-on-completion / skip-completed (deferred to per-request partial success) | §16 |
+
+Engines we evaluated and chose **not** to adopt as a runtime (only their patterns): Prefect, Dagster, Ray, llmq — see §15.
