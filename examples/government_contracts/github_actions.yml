@@ -1,0 +1,79 @@
+# .github/workflows/process-contracts.yml
+#
+# Two workflows share one "data" repo for state:
+#   - daily:  scrape new documents, start new pipelines
+#   - hourly: poll in-flight batch jobs; advance pipelines that just completed
+#
+# Both workflows commit & push state changes to the data repo.
+# GitHub Actions concurrency groups prevent parallel runs of the same workflow.
+
+name: Process Government Contracts
+
+on:
+  schedule:
+    - cron: "0 6 * * *"    # daily at 06:00 UTC  → scrape + submit
+    - cron: "0 * * * *"    # hourly              → poll + advance
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.schedule || 'manual' }}
+  cancel-in-progress: false   # let the running job finish; next one queues
+
+jobs:
+  daily-scrape:
+    if: github.event.schedule == '0 6 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: my-org/contracts-data
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - run: pip install llm-batch google-cloud-aiplatform pymupdf
+
+      - name: Scrape new documents and start pipelines
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GCP_SA_KEY_PATH }}
+        run: python scrape_and_submit.py
+
+      - name: Commit and push state
+        run: |
+          cd data
+          git config user.email "bot@example.com"
+          git config user.name "Contracts Bot"
+          git add -A
+          git diff --staged --quiet || git commit -m "daily: start new pipelines [skip ci]"
+          git push
+
+  hourly-poll:
+    if: github.event.schedule == '0 * * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: my-org/contracts-data
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - run: pip install llm-batch google-cloud-aiplatform pymupdf
+
+      - name: Poll batch jobs and advance completed pipelines
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GCP_SA_KEY_PATH }}
+        run: llm-batch poll ./data/state
+
+      - name: Commit and push state
+        run: |
+          cd data
+          git config user.email "bot@example.com"
+          git config user.name "Contracts Bot"
+          git add -A
+          git diff --staged --quiet || git commit -m "hourly: poll batch jobs [skip ci]"
+          git push --rebase  # rebase-retry handles the daily/hourly race
