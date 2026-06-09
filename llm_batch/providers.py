@@ -262,3 +262,79 @@ def poll_batch(handle: BatchHandle) -> PollResult:
     return PollResult(
         status="completed", texts=texts, usage=total, cost=cost,
         output_file_id=output_file_id)
+
+
+def cleanup(handle: BatchHandle) -> None:
+    """Delete provider-side batch artifacts. Best-effort; never raises.
+
+    Per spec §7: OpenAI deletes file objects (quota); Vertex deletes GCS objects
+    (billing); Gemini-API and Anthropic auto-expire so this is a no-op.
+    """
+    provider = handle.provider
+    if provider == "openai":
+        for file_id in (handle.input_file_id, handle.output_file_id):
+            if not file_id:
+                continue
+            try:
+                litellm.file_delete(file_id=file_id, custom_llm_provider="openai")
+            except Exception:
+                pass  # best-effort: result is already persisted before we get here
+    elif provider == "vertex_ai":
+        for uri in (handle.input_file_id, handle.output_file_id):
+            if not uri:
+                continue
+            try:
+                _delete_gcs_object(uri)
+            except Exception:
+                pass
+    # anthropic / gemini: nothing to clean up (free, auto-expiring)
+
+
+def _delete_gcs_object(uri: str) -> None:
+    """Delete a single gs://bucket/path object (or all objects under a prefix)."""
+    if not uri.startswith("gs://"):
+        return
+    from google.cloud import storage  # lazy: only Vertex callers need this
+
+    without_scheme = uri[len("gs://"):]
+    bucket_name, _, path = without_scheme.partition("/")
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    if uri.endswith("/"):
+        for blob in client.list_blobs(bucket_name, prefix=path):
+            blob.delete()
+    else:
+        bucket.blob(path).delete()
+
+
+def cleanup_orphans(provider: str, live_ids: set, older_than_days: int) -> list[str]:
+    """Best-effort sweep of provider-side files with no live local state.
+
+    Implemented for OpenAI (file objects) via the openai SDK; a no-op for other
+    providers (Vertex/Anthropic/Gemini), where listing is provider-specific or
+    unnecessary. Returns the list of deleted ids. Never raises.
+    """
+    if provider != "openai":
+        return []
+    import time
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI()
+        cutoff = time.time() - older_than_days * 86400
+        deleted = []
+        for file_obj in client.files.list(purpose="batch"):
+            if file_obj.id in live_ids:
+                continue
+            created = getattr(file_obj, "created_at", None)
+            if created is not None and created > cutoff:
+                continue
+            try:
+                client.files.delete(file_obj.id)
+                deleted.append(file_obj.id)
+            except Exception:
+                pass
+        return deleted
+    except Exception:
+        return []

@@ -231,3 +231,50 @@ def test_poll_batch_transient_on_file_content(litellm_mock):
     litellm_mock.file_content = boom
     result = providers.poll_batch(_handle())
     assert result.status == "transient_error"
+
+
+def test_cleanup_openai_deletes_input_and_output_files(litellm_mock):
+    deleted = []
+    litellm_mock.file_delete = lambda file_id, custom_llm_provider: deleted.append(file_id)
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1",
+                         input_file_id="files/in-1", output_file_id="files/out-1")
+    providers.cleanup(handle)
+    assert set(deleted) == {"files/in-1", "files/out-1"}
+
+
+def test_cleanup_openai_is_best_effort(litellm_mock):
+    def boom(**k):
+        raise RuntimeError("already deleted")
+    litellm_mock.file_delete = boom
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1",
+                         input_file_id="files/in-1")
+    providers.cleanup(handle)  # must not raise
+
+
+def test_cleanup_anthropic_is_noop(litellm_mock):
+    def boom(**k):
+        raise AssertionError("should not delete for anthropic")
+    litellm_mock.file_delete = boom
+    handle = BatchHandle(provider="anthropic", model="claude-3-5-sonnet", batch_job_id="b1")
+    providers.cleanup(handle)  # no-op, no call
+
+
+def test_cleanup_vertex_deletes_gcs_objects(monkeypatch):
+    deleted = []
+
+    class FakeBlob:
+        def __init__(self, uri):
+            self.uri = uri
+        def delete(self):
+            deleted.append(self.uri)
+
+    def fake_delete_gcs(uri):
+        FakeBlob(uri).delete()
+
+    monkeypatch.setattr(providers, "_delete_gcs_object", fake_delete_gcs)
+    handle = BatchHandle(provider="vertex_ai", model="vertex_ai/gemini-2.5-flash",
+                         batch_job_id="b1",
+                         input_file_id="gs://bucket/in.jsonl",
+                         output_file_id="gs://bucket/out/")
+    providers.cleanup(handle)
+    assert deleted == ["gs://bucket/in.jsonl", "gs://bucket/out/"]
