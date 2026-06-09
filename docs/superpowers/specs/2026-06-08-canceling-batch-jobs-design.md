@@ -151,10 +151,12 @@ Submit-then-cancel is **essentially free** on all three providers:
 
 ## Dependency: litellm Vertex-cancel capability
 
-The installed litellm must include PR #23957 (Vertex `cancel_batch` support). Rather than pin a
-brittle version, verify the capability at startup/CI: assert `litellm.acancel_batch` accepts
-`custom_llm_provider="vertex_ai"` without raising "unsupported provider". If it does not, treat
-Vertex like Anthropic (no speculative; conservative fallback) until litellm is upgraded.
+Vertex `cancel_batch` support (PR #23957) first shipped in **litellm 1.83.0** (PyPI, 2026-03-31);
+all 1.82.x and earlier lack it. The dependency floor in `pyproject.toml` is therefore
+`litellm>=1.83.0`. As defence-in-depth, the speculative path may still verify the capability at
+startup — assert `litellm.acancel_batch` accepts `custom_llm_provider="vertex_ai"` — and, if a
+patched/older litellm is somehow present, treat Vertex like Anthropic (no speculative; conservative
+fallback) rather than erroring.
 
 ## Testing Notes
 
