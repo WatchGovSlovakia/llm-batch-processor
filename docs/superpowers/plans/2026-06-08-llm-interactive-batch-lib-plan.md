@@ -2026,7 +2026,7 @@ def test_retry_resets_failed_to_not_sent(tmp_path, fake_providers, monkeypatch):
     assert job.state == Job.NOT_SENT
     assert job.snapshot()["error_message"] is None
     assert job.execute() is None                    # resubmits
-    assert fake_providers["submit"] == 1
+    assert fake_providers["submit"] == 2            # one initial submit + one after retry
 
 
 def test_retry_noop_if_not_failed(tmp_path, fake_providers):
