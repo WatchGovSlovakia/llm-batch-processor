@@ -161,6 +161,8 @@ class Job:
                 self._state.get("batch_job_id"))
         if state == self.SENT:
             return self._poll()
+        if state == self.CANCEL_REQUESTED:
+            return self._poll_cancel()
         return self._submit()  # NOT_SENT
 
     def set_completed(self, text) -> None:
@@ -351,6 +353,11 @@ class Job:
 
     def _poll(self):
         handle = self._batch_handle()
+        if self._state.get("fallback_strategy") == "speculative":
+            return self._poll_speculative(handle)
+        return self._poll_conservative(handle)
+
+    def _poll_conservative(self, handle):
         result = providers.poll_batch(handle)
 
         if result.status in ("pending", "transient_error"):
@@ -360,12 +367,14 @@ class Job:
             self._save()
             return None
 
-        if result.status == "failed":
+        if result.status in ("failed", "canceled"):
             self._mark_failed(result.error_message, handle, result.output_file_id)
             raise BatchJobFailed(result.error_message or "batch failed",
                                  handle.batch_job_id)
 
-        # completed
+        return self._finish_completed(handle, result)
+
+    def _finish_completed(self, handle, result):
         response = result.texts if self._is_bundle else result.texts[0]
         self._state.update(
             state=self.COMPLETED, response=response, completed_at=_now_iso(),
@@ -379,6 +388,42 @@ class Job:
             except Exception:
                 pass  # best-effort; result already durably saved
         return response
+
+    def _poll_speculative(self, handle):
+        result = providers.poll_batch(handle)
+
+        if result.status == "completed":
+            return self._finish_completed(handle, result)
+
+        if result.status in ("failed", "canceled"):
+            # We have not requested a cancel yet, so 'canceled' means it was
+            # cancelled out of band → treat as a failure.
+            self._mark_failed(result.error_message, handle, result.output_file_id)
+            raise BatchJobFailed(result.error_message or "batch failed",
+                                 handle.batch_job_id)
+
+        # pending or transient_error → still working
+        self._state["poll_attempts"] = self._state.get("poll_attempts", 0) + 1
+        if result.status == "transient_error":
+            self._state["error_message"] = result.error_message
+            self._save()
+            return None
+
+        if self._can_afford_to_wait():
+            self._save()
+            return None
+
+        # Out of time: initiate cancel and hand off to CANCEL_REQUESTED. Do NOT
+        # wait for it to take effect — the next scheduled poll resolves it.
+        try:
+            providers.cancel(handle)
+        except providers.TransientProviderError:
+            self._save()  # cancel failed transiently; retry next poll, stay SENT
+            return None
+        self._state["state"] = self.CANCEL_REQUESTED
+        self._state["cancel_requested_at"] = _now_iso()
+        self._save()
+        return None
 
     def _mark_failed(self, message, handle=None, output_file_id=None):
         self._state["state"] = self.FAILED

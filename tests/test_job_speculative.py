@@ -129,3 +129,78 @@ def test_speculative_anthropic_degrades_to_conservative_with_one_warning(tmp_pat
     assert j1.snapshot()["fallback_strategy"] == "conservative"
     warnings = [r for r in caplog.records if "speculative" in r.getMessage().lower()]
     assert len(warnings) == 1  # one-time, not per job/poll
+
+
+def _seed_speculative_sent(tmp_path, key="x", *, deadline, provider="openai"):
+    """Write a SENT speculative job directly (as it would be after submit)."""
+    handle = FileStorage(str(tmp_path)).for_job(key)
+    handle.save({
+        "key": key, "state": "sent", "mode": "batch", "model": "gpt-4o",
+        "n_requests": 1, "bundle": False, "batch_job_id": "b1",
+        "input_file_id": "f-in", "output_file_id": None,
+        "submitted_at": _now().isoformat(), "completed_at": None,
+        "deadline": deadline, "actual_mode": "batch", "response": None,
+        "usage": {}, "cost": {}, "error_message": None, "poll_attempts": 0,
+        "rerun_cmd": None, "cleanup_provider_files": False,
+        "fallback_strategy": "speculative",
+        "payload": [[{"role": "user", "content": "hi"}]],
+        "litellm_kwargs": {}, "cancel_requested_at": None,
+    })
+    return handle
+
+
+def test_state_a_keeps_waiting_when_time_remains(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
+    monkeypatch.setattr(job_module.providers, "poll_batch",
+                        lambda h: PollResult(status="pending"))
+    cancel_called = {"n": 0}
+    monkeypatch.setattr(job_module.providers, "cancel",
+                        lambda h: cancel_called.__setitem__("n", cancel_called["n"] + 1))
+    handle = _seed_speculative_sent(tmp_path, deadline=(_now() + timedelta(hours=72)).isoformat())
+    job = Job(handle)
+    assert job.execute() is None
+    assert job.state == Job.SENT
+    assert cancel_called["n"] == 0
+
+
+def test_state_a_initiates_cancel_when_out_of_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
+    monkeypatch.setattr(job_module.providers, "poll_batch",
+                        lambda h: PollResult(status="pending"))
+    cancel_called = {"n": 0}
+    monkeypatch.setattr(job_module.providers, "cancel",
+                        lambda h: cancel_called.__setitem__("n", cancel_called["n"] + 1))
+    handle = _seed_speculative_sent(tmp_path, deadline=(_now() + timedelta(hours=1)).isoformat())
+    job = Job(handle)
+    assert job.execute() is None
+    assert job.state == Job.CANCEL_REQUESTED
+    assert cancel_called["n"] == 1
+    assert job.snapshot()["cancel_requested_at"] is not None
+
+
+def test_state_a_completed_returns_result(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: None)
+    monkeypatch.setattr(
+        job_module.providers, "poll_batch",
+        lambda h: PollResult(status="completed", texts=["done"],
+                             usage={}, cost={}, output_file_id="of1"))
+    handle = _seed_speculative_sent(tmp_path, deadline=(_now() + timedelta(hours=1)).isoformat())
+    job = Job(handle)
+    assert job.execute() == "done"
+    assert job.state == Job.COMPLETED
+
+
+def test_state_a_cancel_transient_stays_sent(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
+    monkeypatch.setattr(job_module.providers, "poll_batch",
+                        lambda h: PollResult(status="pending"))
+
+    def boom(h):
+        raise job_module.providers.TransientProviderError("rate limited")
+
+    monkeypatch.setattr(job_module.providers, "cancel", boom)
+    handle = _seed_speculative_sent(tmp_path, deadline=(_now() + timedelta(hours=1)).isoformat())
+    job = Job(handle)
+    assert job.execute() is None
+    assert job.state == Job.SENT  # cancel failed transiently; retry next poll
