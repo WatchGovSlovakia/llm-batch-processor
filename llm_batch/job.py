@@ -218,6 +218,25 @@ class Job:
             return True
         return remaining >= self._speculative_window_hours()
 
+    def _warn_speculative_downgrade(self, provider: str) -> None:
+        if provider in _SPECULATIVE_DOWNGRADE_WARNED:
+            return
+        _SPECULATIVE_DOWNGRADE_WARNED.add(provider)
+        _LOG.warning(
+            "speculative fallback_strategy is unavailable for provider %r "
+            "(litellm cannot cancel its batches); falling back to conservative.",
+            provider)
+
+    def _effective_strategy(self) -> str:
+        """Resolve the strategy actually used, degrading speculative when needed."""
+        if self._fallback_strategy != "speculative":
+            return "conservative"
+        provider = self._provider()
+        if not providers.provider_supports_cancel(provider):
+            self._warn_speculative_downgrade(provider)
+            return "conservative"
+        return "speculative"
+
     def _should_use_interactive(self) -> bool:
         if self._mode == "interactive":
             return True
@@ -263,9 +282,20 @@ class Job:
         if self._payload is None:
             raise RuntimeError(f"job {self._key!r} has no request payload to submit")
 
+        if self._mode == "interactive":
+            return self._submit_interactive()
+
+        if self._effective_strategy() == "speculative":
+            # Submit optimistically unless the deadline is already inside the
+            # cancel+re-issue window, in which case batch is pointless.
+            if not self._can_afford_to_wait():
+                return self._submit_interactive()
+            return self._submit_batch(strategy="speculative")
+
+        # conservative: decide once, here, using the worst-case turnaround margin.
         if self._should_use_interactive():
             return self._submit_interactive()
-        return self._submit_batch()
+        return self._submit_batch(strategy="conservative")
 
     def _submit_interactive(self):
         texts = []
@@ -289,7 +319,7 @@ class Job:
         self._save()
         return response
 
-    def _submit_batch(self):
+    def _submit_batch(self, *, strategy="conservative"):
         try:
             handle = providers.submit_batch(self._model, self._payload, **self._kw)
         except providers.TransientProviderError:
@@ -298,7 +328,13 @@ class Job:
         state = self._base_state()
         state.update(state=self.SENT, actual_mode="batch",
                      batch_job_id=handle.batch_job_id,
-                     input_file_id=handle.input_file_id)
+                     input_file_id=handle.input_file_id,
+                     fallback_strategy=strategy)
+        if strategy == "speculative":
+            # Persist enough to reconstruct and re-issue interactively from a
+            # later scheduled poll (the poller rebuilds Job with no payload/kwargs).
+            state["payload"] = self._payload
+            state["litellm_kwargs"] = dict(self._kw)
         self._state = state
         self._save()
         return None
