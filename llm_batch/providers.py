@@ -165,6 +165,25 @@ def submit_batch(model: str, requests: list, **kw) -> BatchHandle:
     )
 
 
+def cancel(handle: BatchHandle) -> None:
+    """Initiate cancellation of a batch job and return immediately.
+
+    Delegates to litellm for all providers (OpenAI/Azure/Vertex). Does NOT wait
+    for the cancel to take effect — the outcome is observed by a later poll_batch
+    (the job transitions through CANCEL_REQUESTED). Transient errors are wrapped so
+    the caller can leave the job in place and retry on the next scheduled poll.
+    """
+    try:
+        litellm.cancel_batch(
+            batch_id=handle.batch_job_id,
+            custom_llm_provider=handle.provider,
+        )
+    except Exception as exc:
+        if _is_transient(exc):
+            raise TransientProviderError(str(exc)) from exc
+        raise
+
+
 def complete(model: str, messages: list, **kw) -> CompletionResult:
     """Interactive path: one immediate completion with usage + cost."""
     try:

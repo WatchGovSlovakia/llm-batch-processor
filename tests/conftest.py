@@ -25,6 +25,7 @@ def litellm_mock(monkeypatch):
     fake.completion = _not_configured
     fake.file_delete = lambda *a, **k: None
     fake.cost_per_token = lambda **k: (0.0, 0.0)
+    fake.cancel_batch = _not_configured
 
     import llm_batch.providers as providers
     monkeypatch.setattr(providers, "litellm", fake)
