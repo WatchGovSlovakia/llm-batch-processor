@@ -415,6 +415,7 @@ class Job:
 
         # Out of time: initiate cancel and hand off to CANCEL_REQUESTED. Do NOT
         # wait for it to take effect — the next scheduled poll resolves it.
+        # Safe to re-cancel if we crash before the save below: a repeat cancel_batch on an already-cancelling job is idempotent (no fee).
         try:
             providers.cancel(handle)
         except providers.TransientProviderError:

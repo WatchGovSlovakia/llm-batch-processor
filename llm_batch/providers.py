@@ -52,7 +52,7 @@ class BatchHandle:
 class PollResult:
     """Outcome of one poll of a batch job."""
 
-    status: str  # "pending" | "completed" | "failed" | "transient_error"
+    status: str  # "pending" | "completed" | "failed" | "transient_error" | "canceled"
     texts: list[str] | None = None
     usage: dict | None = None
     cost: dict | None = None
