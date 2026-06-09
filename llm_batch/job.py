@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 from llm_batch import providers
 from llm_batch.errors import BatchJobFailed
 from llm_batch.providers import BatchHandle
+
+_LOG = logging.getLogger("llm_batch")
+# Providers already warned about a speculative→conservative downgrade (process-wide,
+# so the warning is emitted once, not once per poll).
+_SPECULATIVE_DOWNGRADE_WARNED: set[str] = set()
 
 
 def _now() -> datetime:
@@ -37,6 +43,7 @@ _PERSISTED_FIELDS = (
     "input_file_id", "output_file_id", "submitted_at", "completed_at", "deadline",
     "actual_mode", "response", "usage", "cost", "error_message", "poll_attempts",
     "rerun_cmd", "cleanup_provider_files",
+    "fallback_strategy", "payload", "litellm_kwargs", "cancel_requested_at",
 )
 
 
@@ -55,13 +62,18 @@ class Job:
 
     NOT_SENT = "not_sent"
     SENT = "sent"
+    CANCEL_REQUESTED = "cancel_requested"
     COMPLETED = "completed"
     FAILED = "failed"
 
     def __init__(self, storage, key=None, *, messages=None, requests=None,
                  model=None, mode="batch", deadline=None,
                  max_batch_turnaround_hours=24, rerun_cmd=None,
-                 cleanup_provider_files=True, **litellm_kwargs):
+                 cleanup_provider_files=True,
+                 fallback_strategy="conservative", poll_interval_hours=1.0,
+                 interactive_runtime_estimate_hours=0.25,
+                 cancel_margin_hours=None, cancel_resolution_timeout_hours=None,
+                 **litellm_kwargs):
         if messages is not None and requests is not None:
             raise ValueError("pass either messages= or requests=, not both")
 
@@ -82,6 +94,11 @@ class Job:
         self._rerun_cmd = rerun_cmd
         self._cleanup = cleanup_provider_files
         self._kw = litellm_kwargs
+        self._fallback_strategy = fallback_strategy
+        self._poll_interval_h = poll_interval_hours
+        self._interactive_estimate_h = interactive_runtime_estimate_hours
+        self._cancel_margin_h = cancel_margin_hours
+        self._cancel_resolution_timeout_h = cancel_resolution_timeout_hours
         self._state: dict = {}
 
         if self._storage.load():
@@ -97,6 +114,11 @@ class Job:
                 self._rerun_cmd = self._state.get("rerun_cmd")
             if self._state.get("cleanup_provider_files") is not None:
                 self._cleanup = self._state.get("cleanup_provider_files")
+            if self._payload is None and self._state.get("payload") is not None:
+                self._payload = self._state.get("payload")
+                self._is_bundle = bool(self._state.get("bundle"))
+            if not self._kw and self._state.get("litellm_kwargs"):
+                self._kw = dict(self._state.get("litellm_kwargs"))
 
     # --- public API -----------------------------------------------------
 
@@ -186,6 +208,10 @@ class Job:
             "cost": dict(_ZERO_COST),
             "error_message": None,
             "poll_attempts": 0,
+            "fallback_strategy": "conservative",
+            "payload": None,
+            "litellm_kwargs": None,
+            "cancel_requested_at": None,
         }
 
     def _save(self) -> None:
