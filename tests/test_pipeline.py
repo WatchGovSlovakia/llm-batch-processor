@@ -76,3 +76,13 @@ def test_finish_removes_local_state(tmp_path, fake_providers):
     p.finish()
     assert not (tmp_path / "a.json").exists()
     assert not (tmp_path / "pipeline.json").exists()
+
+
+def test_save_meta_deadline_propagates_to_jobs(tmp_path, fake_providers):
+    # save_meta sets a tight deadline AFTER init; jobs created afterward must
+    # see it and fall back to interactive (not submit a doomed batch).
+    p = Pipeline(state_dir=str(tmp_path), mode="batch")
+    p.save_meta({"deadline": (_now() + timedelta(hours=2)).isoformat()})
+    job = p.job("x", messages=[{"role": "user", "content": "hi"}], model="gpt-4o")
+    job.execute()
+    assert job.snapshot()["actual_mode"] == "interactive"

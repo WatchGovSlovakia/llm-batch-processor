@@ -36,6 +36,7 @@ class BatchHandle:
     batch_job_id: str
     input_file_id: str | None = None
     output_file_id: str | None = None
+    n_requests: int | None = None  # expected result count, to verify completeness
 
 
 @dataclass
@@ -151,6 +152,7 @@ def submit_batch(model: str, requests: list, **kw) -> BatchHandle:
         model=model,
         batch_job_id=batch.id,
         input_file_id=file_obj.id,
+        n_requests=len(requests),
     )
 
 
@@ -257,7 +259,18 @@ def poll_batch(handle: BatchHandle) -> PollResult:
         total["completion_tokens"] += usage["completion_tokens"]
         total["total_tokens"] += usage["total_tokens"]
 
-    texts = [results_by_id[f"req-{i}"] for i in range(len(results_by_id))]
+    # Verify completeness: a "completed" batch must yield every submitted
+    # request (spec §5.4 — n_requests lets us confirm we got every result).
+    expected = handle.n_requests if handle.n_requests is not None else len(results_by_id)
+    texts = []
+    for i in range(expected):
+        custom_id = f"req-{i}"
+        if custom_id not in results_by_id:
+            return PollResult(
+                status="failed", output_file_id=output_file_id,
+                error_message=(f"missing result for {custom_id} "
+                               f"({len(results_by_id)}/{expected} returned)"))
+        texts.append(results_by_id[custom_id])
     cost = _cost_dict(handle.model, total, batch=True)
     return PollResult(
         status="completed", texts=texts, usage=total, cost=cost,

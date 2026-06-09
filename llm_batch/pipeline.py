@@ -50,6 +50,9 @@ class Pipeline:
     def save_meta(self, extra: dict) -> None:
         """Merge extra fields into pipeline.json (e.g. pdf_url, domain deadline)."""
         self._meta.update(extra)
+        # Keep the active deadline in sync so jobs minted after save_meta()
+        # inherit the updated deadline (otherwise the fallback uses a stale one).
+        self._deadline = self._meta.get("deadline")
         self._backend.for_meta().save(self._meta)
 
     def job(self, key, *, messages=None, requests=None, model=None, **litellm_kwargs) -> Job:

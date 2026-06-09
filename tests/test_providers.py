@@ -278,3 +278,26 @@ def test_cleanup_vertex_deletes_gcs_objects(monkeypatch):
                          output_file_id="gs://bucket/out/")
     providers.cleanup(handle)
     assert deleted == ["gs://bucket/in.jsonl", "gs://bucket/out/"]
+
+
+def test_poll_batch_missing_bundle_result_is_terminal(litellm_mock):
+    # provider reports completed but returns fewer results than submitted
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1",
+                         input_file_id="f-in", n_requests=3)
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: batch_output_jsonl(["only one of three"])
+    litellm_mock.cost_per_token = lambda **k: (0.0, 0.0)
+    result = providers.poll_batch(handle)
+    assert result.status == "failed"
+    assert "missing" in result.error_message.lower()
+
+
+def test_poll_batch_complete_bundle_with_expected_count(litellm_mock):
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1",
+                         input_file_id="f-in", n_requests=2)
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: batch_output_jsonl(["a", "b"])
+    litellm_mock.cost_per_token = lambda **k: (0.0, 0.0)
+    result = providers.poll_batch(handle)
+    assert result.status == "completed"
+    assert result.texts == ["a", "b"]

@@ -242,6 +242,7 @@ class Job:
             batch_job_id=self._state.get("batch_job_id"),
             input_file_id=self._state.get("input_file_id"),
             output_file_id=self._state.get("output_file_id"),
+            n_requests=self._state.get("n_requests"),
         )
 
     def _poll(self):
