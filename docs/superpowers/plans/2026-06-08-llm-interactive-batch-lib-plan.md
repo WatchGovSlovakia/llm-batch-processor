@@ -534,7 +534,10 @@ class FileStorage:
         self._dir = directory
 
     def for_job(self, key: str) -> _FileJobHandle:
-        return _FileJobHandle(os.path.join(self._dir, f"{key}.json"))
+        # Auto-load so a freshly-minted handle reflects any persisted state.
+        handle = _FileJobHandle(os.path.join(self._dir, f"{key}.json"))
+        handle.load()
+        return handle
 
     def for_meta(self) -> _FileJobHandle:
         return _FileJobHandle(os.path.join(self._dir, META_FILENAME))
@@ -1396,7 +1399,7 @@ def fake_providers(monkeypatch):
     return calls
 
 
-def _handle(tmp_path, key="ocr"):
+def _handle(tmp_path, key="x"):
     return FileStorage(str(tmp_path)).for_job(key)
 
 
@@ -2023,7 +2026,7 @@ def test_retry_resets_failed_to_not_sent(tmp_path, fake_providers, monkeypatch):
     assert job.state == Job.NOT_SENT
     assert job.snapshot()["error_message"] is None
     assert job.execute() is None                    # resubmits
-    assert fake_providers["submit"] == 1
+    assert fake_providers["submit"] == 2            # one initial submit + one after retry
 
 
 def test_retry_noop_if_not_failed(tmp_path, fake_providers):

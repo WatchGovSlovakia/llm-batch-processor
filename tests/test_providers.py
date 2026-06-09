@@ -1,0 +1,303 @@
+import json
+
+import pytest
+
+from llm_batch import providers
+from llm_batch.providers import BatchHandle, CompletionResult, PollResult
+from tests.conftest import completion_response, make_obj
+
+
+def test_provider_of_vertex():
+    assert providers.provider_of("vertex_ai/gemini-2.5-flash") == "vertex_ai"
+
+
+def test_provider_of_anthropic():
+    assert providers.provider_of("claude-3-5-sonnet-20241022") == "anthropic"
+    assert providers.provider_of("anthropic/claude-3-5-sonnet") == "anthropic"
+
+
+def test_provider_of_openai_bare_and_prefixed():
+    assert providers.provider_of("gpt-4o") == "openai"
+    assert providers.provider_of("azure/gpt-4o") == "azure"
+
+
+def test_price_from_usage_sums_prompt_and_completion(litellm_mock):
+    litellm_mock.cost_per_token = lambda **k: (0.01, 0.02)
+    usd = providers._price_from_usage("gpt-4o", {"prompt_tokens": 100, "completion_tokens": 50})
+    assert usd == pytest.approx(0.03)
+
+
+def test_price_from_usage_swallows_errors(litellm_mock):
+    def boom(**k):
+        raise RuntimeError("no pricing data")
+    litellm_mock.cost_per_token = boom
+    assert providers._price_from_usage("weird/model", {"prompt_tokens": 1}) == 0.0
+
+
+def test_is_transient_by_status_code():
+    err = RuntimeError("boom")
+    err.status_code = 429
+    assert providers._is_transient(err) is True
+    err.status_code = 400
+    assert providers._is_transient(err) is False
+
+
+def test_is_transient_by_type_name():
+    class APITimeoutError(Exception):
+        pass
+    assert providers._is_transient(APITimeoutError("slow")) is True
+
+    class BadRequestError(Exception):
+        pass
+    assert providers._is_transient(BadRequestError("nope")) is False
+
+
+def test_dataclasses_have_expected_fields():
+    h = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1")
+    assert h.input_file_id is None and h.output_file_id is None
+    pr = PollResult(status="pending")
+    assert pr.texts is None and pr.cost is None
+    cr = CompletionResult(text="hi", usage={}, cost={})
+    assert cr.text == "hi"
+
+
+def test_submit_batch_uploads_jsonl_and_creates_batch(litellm_mock):
+    captured = {}
+
+    def create_file(file, purpose, custom_llm_provider):
+        captured["file"] = file
+        captured["provider"] = custom_llm_provider
+        return make_obj(id="files/in-1")
+
+    def create_batch(**kwargs):
+        captured["batch_kwargs"] = kwargs
+        return make_obj(id="batches/job-1")
+
+    litellm_mock.create_file = create_file
+    litellm_mock.create_batch = create_batch
+
+    handle = providers.submit_batch(
+        "vertex_ai/gemini-2.5-flash",
+        [[{"role": "user", "content": "hi"}], [{"role": "user", "content": "bye"}]],
+        response_format={"type": "json_object"},
+    )
+
+    assert handle.provider == "vertex_ai"
+    assert handle.batch_job_id == "batches/job-1"
+    assert handle.input_file_id == "files/in-1"
+    assert captured["provider"] == "vertex_ai"
+    assert captured["batch_kwargs"]["input_file_id"] == "files/in-1"
+
+    # JSONL body: one line per request, custom_id req-0..req-N, kwargs forwarded into body
+    _name, buf, _mime = captured["file"]
+    body = buf.getvalue().decode()
+    lines = [json.loads(l) for l in body.splitlines() if l.strip()]
+    assert [l["custom_id"] for l in lines] == ["req-0", "req-1"]
+    assert lines[0]["body"]["messages"] == [{"role": "user", "content": "hi"}]
+    assert lines[0]["body"]["response_format"] == {"type": "json_object"}
+
+
+def test_submit_batch_wraps_transient_errors(litellm_mock):
+    def boom(*a, **k):
+        e = RuntimeError("429 rate limited")
+        e.status_code = 429
+        raise e
+    litellm_mock.create_file = boom
+    with pytest.raises(providers.TransientProviderError):
+        providers.submit_batch("gpt-4o", [[{"role": "user", "content": "x"}]])
+
+
+def test_submit_batch_reraises_terminal_errors(litellm_mock):
+    def boom(*a, **k):
+        e = ValueError("invalid model")  # not transient
+        raise e
+    litellm_mock.create_file = boom
+    with pytest.raises(ValueError):
+        providers.submit_batch("gpt-4o", [[{"role": "user", "content": "x"}]])
+
+
+def test_complete_returns_text_usage_and_cost(litellm_mock):
+    litellm_mock.completion = lambda **k: completion_response("the answer", {
+        "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150})
+    litellm_mock.cost_per_token = lambda **k: (0.01, 0.02)
+
+    result = providers.complete("gpt-4o", [{"role": "user", "content": "q"}])
+    assert result.text == "the answer"
+    assert result.usage["total_tokens"] == 150
+    # interactive path: charged == interactive, no savings
+    assert result.cost["charged_usd"] == pytest.approx(0.03)
+    assert result.cost["saved_usd"] == 0.0
+
+
+def test_complete_forwards_kwargs(litellm_mock):
+    seen = {}
+    def completion(**k):
+        seen.update(k)
+        return completion_response("ok")
+    litellm_mock.completion = completion
+    litellm_mock.cost_per_token = lambda **k: (0.0, 0.0)
+    providers.complete("gpt-4o", [{"role": "user", "content": "q"}],
+                       response_format={"type": "json_object"}, temperature=0.2)
+    assert seen["response_format"] == {"type": "json_object"}
+    assert seen["temperature"] == 0.2
+
+
+def test_complete_wraps_transient_errors(litellm_mock):
+    class APITimeoutError(Exception):
+        pass
+    def boom2(**k):
+        raise APITimeoutError("slow")
+    litellm_mock.completion = boom2
+    with pytest.raises(providers.TransientProviderError):
+        providers.complete("gpt-4o", [{"role": "user", "content": "q"}])
+
+
+from tests.conftest import batch_output_jsonl
+
+
+def _handle(model="gpt-4o"):
+    return BatchHandle(provider=providers.provider_of(model), model=model,
+                       batch_job_id="batches/job-1", input_file_id="files/in-1")
+
+
+def test_poll_batch_pending(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="in_progress")
+    result = providers.poll_batch(_handle())
+    assert result.status == "pending"
+
+
+def test_poll_batch_completed_single(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(
+        status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: batch_output_jsonl(["extracted text"])
+    litellm_mock.cost_per_token = lambda **k: (0.01, 0.02)
+
+    result = providers.poll_batch(_handle())
+    assert result.status == "completed"
+    assert result.texts == ["extracted text"]
+    assert result.output_file_id == "files/out-1"
+    # batch discount: charged is half of interactive
+    assert result.cost["charged_usd"] == pytest.approx(result.cost["interactive_usd"] * 0.5)
+    assert result.cost["saved_usd"] == pytest.approx(result.cost["interactive_usd"] * 0.5)
+
+
+def test_poll_batch_completed_bundle_ordered_by_custom_id(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(
+        status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: batch_output_jsonl(["page one", "page two", "page three"])
+    litellm_mock.cost_per_token = lambda **k: (0.0, 0.0)
+    result = providers.poll_batch(_handle())
+    assert result.texts == ["page one", "page two", "page three"]
+    assert result.usage["total_tokens"] == 45  # 3 requests * 15
+
+
+def test_poll_batch_provider_failed_is_terminal(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="failed")
+    result = providers.poll_batch(_handle())
+    assert result.status == "failed"
+
+
+def test_poll_batch_expired_is_terminal(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="expired")
+    assert providers.poll_batch(_handle()).status == "failed"
+
+
+def test_poll_batch_per_request_error_is_terminal(litellm_mock):
+    from tests.conftest import make_obj as mk
+    bad_body = '{"custom_id": "req-0", "response": {"status_code": 400, "body": {}}}\n'
+    litellm_mock.retrieve_batch = lambda **k: mk(status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: mk(text=bad_body, content=bad_body.encode())
+    result = providers.poll_batch(_handle())
+    assert result.status == "failed"
+    assert "req-0" in result.error_message
+
+
+def test_poll_batch_transient_on_retrieve(litellm_mock):
+    def boom(**k):
+        e = RuntimeError("503 unavailable")
+        e.status_code = 503
+        raise e
+    litellm_mock.retrieve_batch = boom
+    result = providers.poll_batch(_handle())
+    assert result.status == "transient_error"
+
+
+def test_poll_batch_transient_on_file_content(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="completed", output_file_id="files/out-1")
+    def boom(**k):
+        e = RuntimeError("429")
+        e.status_code = 429
+        raise e
+    litellm_mock.file_content = boom
+    result = providers.poll_batch(_handle())
+    assert result.status == "transient_error"
+
+
+def test_cleanup_openai_deletes_input_and_output_files(litellm_mock):
+    deleted = []
+    litellm_mock.file_delete = lambda file_id, custom_llm_provider: deleted.append(file_id)
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1",
+                         input_file_id="files/in-1", output_file_id="files/out-1")
+    providers.cleanup(handle)
+    assert set(deleted) == {"files/in-1", "files/out-1"}
+
+
+def test_cleanup_openai_is_best_effort(litellm_mock):
+    def boom(**k):
+        raise RuntimeError("already deleted")
+    litellm_mock.file_delete = boom
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1",
+                         input_file_id="files/in-1")
+    providers.cleanup(handle)  # must not raise
+
+
+def test_cleanup_anthropic_is_noop(litellm_mock):
+    def boom(**k):
+        raise AssertionError("should not delete for anthropic")
+    litellm_mock.file_delete = boom
+    handle = BatchHandle(provider="anthropic", model="claude-3-5-sonnet", batch_job_id="b1")
+    providers.cleanup(handle)  # no-op, no call
+
+
+def test_cleanup_vertex_deletes_gcs_objects(monkeypatch):
+    deleted = []
+
+    class FakeBlob:
+        def __init__(self, uri):
+            self.uri = uri
+        def delete(self):
+            deleted.append(self.uri)
+
+    def fake_delete_gcs(uri):
+        FakeBlob(uri).delete()
+
+    monkeypatch.setattr(providers, "_delete_gcs_object", fake_delete_gcs)
+    handle = BatchHandle(provider="vertex_ai", model="vertex_ai/gemini-2.5-flash",
+                         batch_job_id="b1",
+                         input_file_id="gs://bucket/in.jsonl",
+                         output_file_id="gs://bucket/out/")
+    providers.cleanup(handle)
+    assert deleted == ["gs://bucket/in.jsonl", "gs://bucket/out/"]
+
+
+def test_poll_batch_missing_bundle_result_is_terminal(litellm_mock):
+    # provider reports completed but returns fewer results than submitted
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1",
+                         input_file_id="f-in", n_requests=3)
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: batch_output_jsonl(["only one of three"])
+    litellm_mock.cost_per_token = lambda **k: (0.0, 0.0)
+    result = providers.poll_batch(handle)
+    assert result.status == "failed"
+    assert "missing" in result.error_message.lower()
+
+
+def test_poll_batch_complete_bundle_with_expected_count(litellm_mock):
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1",
+                         input_file_id="f-in", n_requests=2)
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: batch_output_jsonl(["a", "b"])
+    litellm_mock.cost_per_token = lambda **k: (0.0, 0.0)
+    result = providers.poll_batch(handle)
+    assert result.status == "completed"
+    assert result.texts == ["a", "b"]
