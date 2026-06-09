@@ -125,6 +125,28 @@ class Job:
             return self._poll()
         return self._submit()  # NOT_SENT
 
+    def set_completed(self, text) -> None:
+        """Mark this job COMPLETED with a preset result and no LLM call.
+
+        Used when the caller already has the answer (e.g. fitz extracted the
+        PDF text directly). `text` is stored verbatim as the response.
+        """
+        if self.state == self.COMPLETED:
+            return
+        state = self._base_state()
+        state.update(state=self.COMPLETED, actual_mode="preset",
+                     completed_at=_now_iso(), response=text)
+        self._state = state
+        self._save()
+
+    def retry(self) -> None:
+        """Reset a FAILED job to NOT_SENT so the next execute() resubmits."""
+        if self.state != self.FAILED:
+            return
+        self._state["state"] = self.NOT_SENT
+        self._state["error_message"] = None
+        self._save()
+
     # --- internals ------------------------------------------------------
 
     def _should_use_interactive(self) -> bool:
