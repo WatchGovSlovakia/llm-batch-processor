@@ -128,9 +128,16 @@ class Job:
     # --- internals ------------------------------------------------------
 
     def _should_use_interactive(self) -> bool:
-        # Deadline-aware fallback is added in Task 9; for now only an explicit
-        # interactive mode forces the immediate path.
-        return self._mode == "interactive"
+        if self._mode == "interactive":
+            return True
+        if self._deadline is None:
+            return False
+        deadline_dt = _parse_iso(self._deadline)
+        if deadline_dt is None:
+            return False
+        hours_remaining = (deadline_dt - _now()).total_seconds() / 3600.0
+        # Too little time for another worst-case batch round → go interactive now.
+        return hours_remaining < self._max_turnaround
 
     def _base_state(self) -> dict:
         return {
