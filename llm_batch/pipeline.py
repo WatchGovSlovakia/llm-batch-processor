@@ -1,0 +1,76 @@
+"""Pipeline — shared state dir + config across a multi-step job sequence."""
+
+from __future__ import annotations
+
+from datetime import timedelta
+
+from llm_batch.job import Job, _now, _now_iso
+from llm_batch.storage.file import FileStorage
+
+
+class Pipeline:
+    """Convenience wrapper that mints namespaced Jobs over one state dir.
+
+    A bare Job works standalone; Pipeline just removes boilerplate and records
+    the deadline anchor (`pipeline_started_at`) once in pipeline.json.
+    """
+
+    def __init__(self, state_dir, *, mode="batch", deadline=None,
+                 time_budget_hours=None, max_batch_turnaround_hours=24,
+                 rerun_cmd=None, storage=None, cleanup_provider_files=True):
+        self._state_dir = state_dir
+        self._mode = mode
+        self._max_turnaround = max_batch_turnaround_hours
+        self._rerun_cmd = rerun_cmd
+        self._cleanup = cleanup_provider_files
+        self._backend = storage if storage is not None else FileStorage(state_dir)
+        self._meta = self._load_or_init_meta(deadline, time_budget_hours)
+        self._deadline = self._meta.get("deadline")
+
+    def _load_or_init_meta(self, deadline, time_budget_hours) -> dict:
+        handle = self._backend.for_meta()
+        if handle.load():
+            return handle.snapshot()
+        started = _now()
+        resolved_deadline = deadline
+        if resolved_deadline is None and time_budget_hours is not None:
+            resolved_deadline = (started + timedelta(hours=time_budget_hours)).isoformat()
+        meta = {
+            "pipeline_started_at": started.isoformat(),
+            "deadline": resolved_deadline,
+            "mode": self._mode,
+            "rerun_cmd": self._rerun_cmd,
+        }
+        handle.save(meta)
+        return meta
+
+    def meta(self) -> dict:
+        return dict(self._meta)
+
+    def save_meta(self, extra: dict) -> None:
+        """Merge extra fields into pipeline.json (e.g. pdf_url, domain deadline)."""
+        self._meta.update(extra)
+        self._backend.for_meta().save(self._meta)
+
+    def job(self, key, *, messages=None, requests=None, model=None, **litellm_kwargs) -> Job:
+        return Job(
+            self._backend.for_job(key), key,
+            messages=messages, requests=requests, model=model,
+            mode=self._mode, deadline=self._deadline,
+            max_batch_turnaround_hours=self._max_turnaround,
+            rerun_cmd=self._rerun_cmd, cleanup_provider_files=self._cleanup,
+            **litellm_kwargs)
+
+    def cost_summary(self) -> dict:
+        total = {"charged_usd": 0.0, "interactive_usd": 0.0, "saved_usd": 0.0}
+        for handle in self._backend.iter_jobs():
+            cost = handle.get("cost") or {}
+            for k in total:
+                total[k] += cost.get(k, 0.0)
+        return total
+
+    def finish(self) -> None:
+        """Delete this pipeline's local state files."""
+        for handle in list(self._backend.iter_jobs()):
+            handle.finish()
+        self._backend.for_meta().finish()
