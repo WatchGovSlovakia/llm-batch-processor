@@ -294,3 +294,47 @@ def test_state_b_reissue_transient_stays_cancel_requested(tmp_path, monkeypatch)
     job = Job(handle)
     assert job.execute() is None
     assert job.state == Job.CANCEL_REQUESTED  # retry interactive next poll
+
+
+def test_full_speculative_lifecycle_cancel_then_reissue(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
+    monkeypatch.setattr(job_module.providers, "provider_supports_cancel", lambda p: True)
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: None)
+    monkeypatch.setattr(
+        job_module.providers, "submit_batch",
+        lambda model, requests, **kw: BatchHandle(
+            provider="openai", model=model, batch_job_id="b1", input_file_id="f1"))
+
+    # Provider state evolves across polls: pending, then cancelled after we ask.
+    state = {"phase": "pending"}
+    monkeypatch.setattr(
+        job_module.providers, "poll_batch",
+        lambda h: PollResult(status=state["phase"]))
+    monkeypatch.setattr(job_module.providers, "cancel",
+                        lambda h: state.__setitem__("phase", "canceled"))
+    monkeypatch.setattr(
+        job_module.providers, "complete",
+        lambda model, messages, **kw: CompletionResult(
+            text="final", usage={}, cost={"charged_usd": 0.02, "interactive_usd": 0.04, "saved_usd": 0.0}))
+
+    # Poll run 1 — submit with ample time (deadline far out).
+    j = _spec_job(tmp_path, deadline=(_now() + timedelta(hours=72)).isoformat())
+    assert j.execute() is None
+    assert j.state == Job.SENT
+
+    # Poll run 2 — reconstruct from storage with a now-tight deadline; out of time
+    # → initiate cancel, transition to CANCEL_REQUESTED. (Rewrite the deadline to
+    # simulate time passing close to the deadline.)
+    storage = FileStorage(str(tmp_path)).for_job("x")
+    snap = storage.snapshot()
+    snap["deadline"] = (_now() + timedelta(hours=1)).isoformat()
+    storage.save(snap)
+    j2 = Job(storage)
+    assert j2.execute() is None
+    assert j2.state == Job.CANCEL_REQUESTED
+
+    # Poll run 3 — provider now reports cancelled → re-issue interactively.
+    j3 = Job(FileStorage(str(tmp_path)).for_job("x"))
+    assert j3.execute() == "final"
+    assert j3.state == Job.COMPLETED
+    assert j3.snapshot()["actual_mode"] == "interactive"
