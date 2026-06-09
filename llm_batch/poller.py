@@ -1,4 +1,4 @@
-"""Poller — central advancement of SENT jobs across a state tree."""
+"""Poller — central advancement of SENT and CANCEL_REQUESTED jobs across a state tree."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from llm_batch.job import Job, _now, _parse_iso
 
 
 class Poller:
-    """Scans SENT jobs, advances completed pipelines, fails stale jobs.
+    """Scans SENT and CANCEL_REQUESTED jobs, advances completed pipelines, fails stale jobs.
 
     `backend` is a directory/namespace-level storage object exposing
     `iter_jobs()` (and `for_job`). `run_cmd` is injectable for testing; it
