@@ -29,10 +29,13 @@ class Poller:
         seen_cmds: set[str] = set()
 
         for handle in self._backend.iter_jobs():
-            if handle.get("state") != Job.SENT:
+            state = handle.get("state")
+            if state not in (Job.SENT, Job.CANCEL_REQUESTED):
                 continue
 
-            if self._is_stale(handle):
+            # Staleness only force-fails SENT jobs; a CANCEL_REQUESTED job is
+            # bounded instead by its cancel_resolution_timeout (re-issues interactively).
+            if state == Job.SENT and self._is_stale(handle):
                 job = Job(handle)
                 job.mark_failed(f"stale: no completion within {self._max_age.days}d")
                 continue
