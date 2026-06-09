@@ -85,6 +85,15 @@ poll forever. Bound it: if `now − cancel_requested_at` exceeds a `cancel_resol
 interactively so the caller still gets a result before/near the deadline. (If the batch later
 completes, `cleanup()` still removes its artifacts.)
 
+**State persistence for interactive re-issue.** The `cancelled → re-issue interactively` branch runs
+inside a *scheduled poll*, where the `Job` is reconstructed from storage with no in-memory request
+payload or litellm kwargs (the poller calls `Job(handle)` with no `messages=`/`requests=`). So a
+`speculative` batch job must **persist its request payload and litellm kwargs at submit time** —
+both are already JSON-serializable (they are embedded into the batch JSONL today) — alongside the
+new `cancel_requested_at` timestamp, so a later poll run can rebuild the exact request and re-issue
+it interactively. Conservative jobs decide interactive-vs-batch at submit time only and need none of
+this, so they do not store it.
+
 ## Cost Findings (already researched — see research files)
 
 Submit-then-cancel is **essentially free** on all three providers:
