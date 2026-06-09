@@ -204,3 +204,93 @@ def test_state_a_cancel_transient_stays_sent(tmp_path, monkeypatch):
     job = Job(handle)
     assert job.execute() is None
     assert job.state == Job.SENT  # cancel failed transiently; retry next poll
+
+
+def _seed_cancel_requested(tmp_path, key="x", *, cancel_requested_at, provider="openai",
+                           model="gpt-4o"):
+    handle = FileStorage(str(tmp_path)).for_job(key)
+    handle.save({
+        "key": key, "state": "cancel_requested", "mode": "batch", "model": model,
+        "n_requests": 1, "bundle": False, "batch_job_id": "b1",
+        "input_file_id": "f-in", "output_file_id": None,
+        "submitted_at": _now().isoformat(), "completed_at": None, "deadline": None,
+        "actual_mode": "batch", "response": None, "usage": {}, "cost": {},
+        "error_message": None, "poll_attempts": 1, "rerun_cmd": None,
+        "cleanup_provider_files": False, "fallback_strategy": "speculative",
+        "payload": [[{"role": "user", "content": "hi"}]],
+        "litellm_kwargs": {}, "cancel_requested_at": cancel_requested_at,
+    })
+    return handle
+
+
+def test_state_b_completed_salvages_batch_result(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: None)
+    monkeypatch.setattr(
+        job_module.providers, "poll_batch",
+        lambda h: PollResult(status="completed", texts=["batched"],
+                             usage={}, cost={}, output_file_id="of1"))
+    handle = _seed_cancel_requested(tmp_path, cancel_requested_at=_now().isoformat())
+    job = Job(handle)
+    assert job.execute() == "batched"
+    assert job.state == Job.COMPLETED
+    assert job.snapshot()["actual_mode"] == "batch"
+
+
+def test_state_b_cancelled_reissues_interactively(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: None)
+    monkeypatch.setattr(job_module.providers, "poll_batch",
+                        lambda h: PollResult(status="canceled"))
+    monkeypatch.setattr(
+        job_module.providers, "complete",
+        lambda model, messages, **kw: CompletionResult(
+            text="interactive-now", usage={}, cost={"charged_usd": 0.02, "interactive_usd": 0.02, "saved_usd": 0.0}))
+    handle = _seed_cancel_requested(tmp_path, cancel_requested_at=_now().isoformat())
+    job = Job(handle)
+    assert job.execute() == "interactive-now"
+    assert job.state == Job.COMPLETED
+    assert job.snapshot()["actual_mode"] == "interactive"
+
+
+def test_state_b_still_queued_keeps_waiting(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
+    monkeypatch.setattr(job_module.providers, "poll_batch",
+                        lambda h: PollResult(status="pending"))
+    handle = _seed_cancel_requested(tmp_path, cancel_requested_at=_now().isoformat())
+    job = Job(handle)
+    assert job.execute() is None
+    assert job.state == Job.CANCEL_REQUESTED
+
+
+def test_state_b_timeout_forces_interactive(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: None)
+    monkeypatch.setattr(job_module.providers, "poll_batch",
+                        lambda h: PollResult(status="pending"))
+    monkeypatch.setattr(
+        job_module.providers, "complete",
+        lambda model, messages, **kw: CompletionResult(
+            text="forced", usage={}, cost={"charged_usd": 0.0, "interactive_usd": 0.0, "saved_usd": 0.0}))
+    # openai resolution timeout default 0.5h; stamp the request 2h ago → expired.
+    stamped = (_now() - timedelta(hours=2)).isoformat()
+    handle = _seed_cancel_requested(tmp_path, cancel_requested_at=stamped)
+    job = Job(handle)
+    assert job.execute() == "forced"
+    assert job.state == Job.COMPLETED
+    assert job.snapshot()["actual_mode"] == "interactive"
+
+
+def test_state_b_reissue_transient_stays_cancel_requested(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
+    monkeypatch.setattr(job_module.providers, "poll_batch",
+                        lambda h: PollResult(status="canceled"))
+
+    def boom(model, messages, **kw):
+        raise job_module.providers.TransientProviderError("rate limited")
+
+    monkeypatch.setattr(job_module.providers, "complete", boom)
+    handle = _seed_cancel_requested(tmp_path, cancel_requested_at=_now().isoformat())
+    job = Job(handle)
+    assert job.execute() is None
+    assert job.state == Job.CANCEL_REQUESTED  # retry interactive next poll

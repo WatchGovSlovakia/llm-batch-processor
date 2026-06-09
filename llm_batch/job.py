@@ -425,6 +425,70 @@ class Job:
         self._save()
         return None
 
+    def _cancel_resolution_expired(self) -> bool:
+        stamped = _parse_iso(self._state.get("cancel_requested_at"))
+        if stamped is None:
+            return False
+        timeout_h = self._cancel_resolution_timeout_h
+        if timeout_h is None:
+            timeout_h = _default_cancel_resolution_timeout(self._provider())
+        elapsed_h = (_now() - stamped).total_seconds() / 3600.0
+        return elapsed_h >= timeout_h
+
+    def _poll_cancel(self):
+        handle = self._batch_handle()
+        result = providers.poll_batch(handle)
+
+        if result.status == "completed":
+            # Finished before the cancel took effect → salvage the batch result.
+            return self._finish_completed(handle, result)
+
+        if result.status == "canceled":
+            return self._reissue_interactive(handle)
+
+        if result.status == "failed":
+            self._mark_failed(result.error_message, handle, result.output_file_id)
+            raise BatchJobFailed(result.error_message or "batch failed",
+                                 handle.batch_job_id)
+
+        # pending / transient_error: cancel not yet effective.
+        self._state["poll_attempts"] = self._state.get("poll_attempts", 0) + 1
+        if result.status == "transient_error":
+            self._state["error_message"] = result.error_message
+        if self._cancel_resolution_expired():
+            # Stop waiting on a cancel that won't settle (e.g. Vertex best-effort).
+            return self._reissue_interactive(handle)
+        self._save()
+        return None
+
+    def _reissue_interactive(self, handle):
+        """Re-run the persisted request interactively and mark COMPLETED."""
+        texts = []
+        usage = dict(_ZERO_USAGE)
+        cost = dict(_ZERO_COST)
+        try:
+            for messages in self._payload:
+                cr = providers.complete(self._model, messages, **self._kw)
+                texts.append(cr.text)
+                _accumulate(usage, cr.usage)
+                _accumulate_cost(cost, cr.cost)
+        except providers.TransientProviderError:
+            self._save()  # stay CANCEL_REQUESTED; retry interactive next poll
+            return None
+
+        response = texts if self._is_bundle else texts[0]
+        self._state.update(
+            state=self.COMPLETED, actual_mode="interactive",
+            completed_at=_now_iso(), response=response, usage=usage, cost=cost,
+            error_message=None)
+        self._save()
+        if self._cleanup:
+            try:
+                providers.cleanup(handle)  # remove the (cancelled) batch artifacts
+            except Exception:
+                pass
+        return response
+
     def _mark_failed(self, message, handle=None, output_file_id=None):
         self._state["state"] = self.FAILED
         self._state["error_message"] = message
