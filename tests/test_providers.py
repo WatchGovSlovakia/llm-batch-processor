@@ -301,3 +301,61 @@ def test_poll_batch_complete_bundle_with_expected_count(litellm_mock):
     result = providers.poll_batch(handle)
     assert result.status == "completed"
     assert result.texts == ["a", "b"]
+
+
+def test_provider_supports_cancel():
+    from llm_batch import providers
+    assert providers.provider_supports_cancel("openai") is True
+    assert providers.provider_supports_cancel("azure") is True
+    assert providers.provider_supports_cancel("vertex_ai") is True
+    assert providers.provider_supports_cancel("anthropic") is False
+    assert providers.provider_supports_cancel("gemini") is False
+
+
+def test_poll_batch_cancelled_is_distinct_status(litellm_mock):
+    from llm_batch import providers
+    from llm_batch.providers import BatchHandle
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="cancelled")
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1")
+    result = providers.poll_batch(handle)
+    assert result.status == "canceled"
+
+
+def test_poll_batch_cancelling_is_pending(litellm_mock):
+    from llm_batch import providers
+    from llm_batch.providers import BatchHandle
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="cancelling")
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1")
+    result = providers.poll_batch(handle)
+    assert result.status == "pending"
+
+
+def test_cancel_delegates_to_litellm_with_provider(litellm_mock):
+    from llm_batch import providers
+    from llm_batch.providers import BatchHandle
+    seen = {}
+
+    def cancel_batch(*, batch_id, custom_llm_provider, **k):
+        seen["batch_id"] = batch_id
+        seen["provider"] = custom_llm_provider
+        return make_obj(id=batch_id, status="cancelling")
+
+    litellm_mock.cancel_batch = cancel_batch
+    handle = BatchHandle(provider="vertex_ai", model="vertex_ai/gemini-1.5-pro", batch_job_id="b9")
+    assert providers.cancel(handle) is None
+    assert seen == {"batch_id": "b9", "provider": "vertex_ai"}
+
+
+def test_cancel_wraps_transient_errors(litellm_mock):
+    from llm_batch import providers
+
+    class Boom(Exception):
+        status_code = 503
+
+    def cancel_batch(**k):
+        raise Boom("service unavailable")
+
+    litellm_mock.cancel_batch = cancel_batch
+    handle = providers.BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1")
+    with pytest.raises(providers.TransientProviderError):
+        providers.cancel(handle)

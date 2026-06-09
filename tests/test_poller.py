@@ -111,3 +111,32 @@ def test_sweep_orphans_delegates_per_provider(tmp_path, fake_providers):
     live_ids, days = seen["openai"]
     assert days == 2
     assert "f-in" in live_ids        # live input file id excluded from deletion
+
+
+def test_poller_advances_cancel_requested_jobs(tmp_path, fake_providers, monkeypatch):
+    from llm_batch.providers import CompletionResult
+    # A CANCEL_REQUESTED job whose batch has now settled as cancelled.
+    handle = FileStorage(str(tmp_path)).for_job("c")
+    handle.save({
+        "key": "c", "state": "cancel_requested", "mode": "batch", "model": "gpt-4o",
+        "n_requests": 1, "bundle": False, "batch_job_id": "b1",
+        "input_file_id": "f-in", "output_file_id": None,
+        "submitted_at": _now().isoformat(), "completed_at": None, "deadline": None,
+        "actual_mode": "batch", "response": None, "usage": {}, "cost": {},
+        "error_message": None, "poll_attempts": 1, "rerun_cmd": None,
+        "cleanup_provider_files": False, "fallback_strategy": "speculative",
+        "payload": [[{"role": "user", "content": "hi"}]],
+        "litellm_kwargs": {}, "cancel_requested_at": _now().isoformat(),
+    })
+    monkeypatch.setattr(job_module.providers, "poll_batch",
+                        lambda h: PollResult(status="canceled"))
+    monkeypatch.setattr(
+        job_module.providers, "complete",
+        lambda model, messages, **kw: CompletionResult(
+            text="reissued", usage={}, cost={"charged_usd": 0.0, "interactive_usd": 0.0, "saved_usd": 0.0}))
+
+    Poller(FileStorage(str(tmp_path))).poll_all()
+
+    reloaded = Job(FileStorage(str(tmp_path)).for_job("c"))
+    assert reloaded.state == Job.COMPLETED
+    assert reloaded.snapshot()["actual_mode"] == "interactive"

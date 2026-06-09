@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 from llm_batch import providers
 from llm_batch.errors import BatchJobFailed
 from llm_batch.providers import BatchHandle
+
+_LOG = logging.getLogger("llm_batch")
+# Providers already warned about a speculative→conservative downgrade (process-wide,
+# so the warning is emitted once, not once per poll).
+_SPECULATIVE_DOWNGRADE_WARNED: set[str] = set()
 
 
 def _now() -> datetime:
@@ -31,12 +37,29 @@ def _parse_iso(value: str | None) -> datetime | None:
 _ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 _ZERO_COST = {"charged_usd": 0.0, "interactive_usd": 0.0, "saved_usd": 0.0}
 
+# Provider-aware timing defaults (hours), used when the caller leaves the knob None.
+_SAFETY_HOURS = 0.1
+_DEFAULT_CANCEL_MARGIN_HOURS = {"openai": 0.25, "azure": 0.25, "vertex_ai": 0.5}
+_FALLBACK_CANCEL_MARGIN_HOURS = 0.5
+_DEFAULT_CANCEL_RESOLUTION_HOURS = {"openai": 0.5, "azure": 0.5, "vertex_ai": 2.0}
+_FALLBACK_CANCEL_RESOLUTION_HOURS = 2.0
+
+
+def _default_cancel_margin(provider: str) -> float:
+    return _DEFAULT_CANCEL_MARGIN_HOURS.get(provider, _FALLBACK_CANCEL_MARGIN_HOURS)
+
+
+def _default_cancel_resolution_timeout(provider: str) -> float:
+    return _DEFAULT_CANCEL_RESOLUTION_HOURS.get(provider, _FALLBACK_CANCEL_RESOLUTION_HOURS)
+
+
 # Fields reconstructed from storage when resuming a job.
 _PERSISTED_FIELDS = (
     "key", "state", "mode", "model", "n_requests", "bundle", "batch_job_id",
     "input_file_id", "output_file_id", "submitted_at", "completed_at", "deadline",
     "actual_mode", "response", "usage", "cost", "error_message", "poll_attempts",
     "rerun_cmd", "cleanup_provider_files",
+    "fallback_strategy", "payload", "litellm_kwargs", "cancel_requested_at",
 )
 
 
@@ -55,13 +78,18 @@ class Job:
 
     NOT_SENT = "not_sent"
     SENT = "sent"
+    CANCEL_REQUESTED = "cancel_requested"
     COMPLETED = "completed"
     FAILED = "failed"
 
     def __init__(self, storage, key=None, *, messages=None, requests=None,
                  model=None, mode="batch", deadline=None,
                  max_batch_turnaround_hours=24, rerun_cmd=None,
-                 cleanup_provider_files=True, **litellm_kwargs):
+                 cleanup_provider_files=True,
+                 fallback_strategy="conservative", poll_interval_hours=1.0,
+                 interactive_runtime_estimate_hours=0.25,
+                 cancel_margin_hours=None, cancel_resolution_timeout_hours=None,
+                 **litellm_kwargs):
         if messages is not None and requests is not None:
             raise ValueError("pass either messages= or requests=, not both")
 
@@ -82,6 +110,11 @@ class Job:
         self._rerun_cmd = rerun_cmd
         self._cleanup = cleanup_provider_files
         self._kw = litellm_kwargs
+        self._fallback_strategy = fallback_strategy
+        self._poll_interval_h = poll_interval_hours
+        self._interactive_estimate_h = interactive_runtime_estimate_hours
+        self._cancel_margin_h = cancel_margin_hours
+        self._cancel_resolution_timeout_h = cancel_resolution_timeout_hours
         self._state: dict = {}
 
         if self._storage.load():
@@ -97,6 +130,11 @@ class Job:
                 self._rerun_cmd = self._state.get("rerun_cmd")
             if self._state.get("cleanup_provider_files") is not None:
                 self._cleanup = self._state.get("cleanup_provider_files")
+            if self._payload is None and self._state.get("payload") is not None:
+                self._payload = self._state.get("payload")
+                self._is_bundle = bool(self._state.get("bundle"))
+            if not self._kw and self._state.get("litellm_kwargs"):
+                self._kw = dict(self._state.get("litellm_kwargs"))
 
     # --- public API -----------------------------------------------------
 
@@ -123,6 +161,8 @@ class Job:
                 self._state.get("batch_job_id"))
         if state == self.SENT:
             return self._poll()
+        if state == self.CANCEL_REQUESTED:
+            return self._poll_cancel()
         return self._submit()  # NOT_SENT
 
     def set_completed(self, text) -> None:
@@ -153,6 +193,51 @@ class Job:
                           self._state.get("output_file_id"))
 
     # --- internals ------------------------------------------------------
+
+    def _provider(self) -> str:
+        return providers.provider_of(self._model)
+
+    def _speculative_window_hours(self) -> float:
+        """Minimum slack the deadline must have to risk waiting one more poll."""
+        margin = self._cancel_margin_h
+        if margin is None:
+            margin = _default_cancel_margin(self._provider())
+        return (self._poll_interval_h + margin
+                + self._interactive_estimate_h + _SAFETY_HOURS)
+
+    def _hours_remaining(self) -> float | None:
+        if self._deadline is None:
+            return None
+        deadline_dt = _parse_iso(self._deadline)
+        if deadline_dt is None:
+            return None
+        return (deadline_dt - _now()).total_seconds() / 3600.0
+
+    def _can_afford_to_wait(self) -> bool:
+        """True if the deadline leaves room to wait for the next scheduled poll."""
+        remaining = self._hours_remaining()
+        if remaining is None:
+            return True
+        return remaining >= self._speculative_window_hours()
+
+    def _warn_speculative_downgrade(self, provider: str) -> None:
+        if provider in _SPECULATIVE_DOWNGRADE_WARNED:
+            return
+        _SPECULATIVE_DOWNGRADE_WARNED.add(provider)
+        _LOG.warning(
+            "speculative fallback_strategy is unavailable for provider %r "
+            "(litellm cannot cancel its batches); falling back to conservative.",
+            provider)
+
+    def _effective_strategy(self) -> str:
+        """Resolve the strategy actually used, degrading speculative when needed."""
+        if self._fallback_strategy != "speculative":
+            return "conservative"
+        provider = self._provider()
+        if not providers.provider_supports_cancel(provider):
+            self._warn_speculative_downgrade(provider)
+            return "conservative"
+        return "speculative"
 
     def _should_use_interactive(self) -> bool:
         if self._mode == "interactive":
@@ -186,6 +271,10 @@ class Job:
             "cost": dict(_ZERO_COST),
             "error_message": None,
             "poll_attempts": 0,
+            "fallback_strategy": "conservative",
+            "payload": None,
+            "litellm_kwargs": None,
+            "cancel_requested_at": None,
         }
 
     def _save(self) -> None:
@@ -195,9 +284,20 @@ class Job:
         if self._payload is None:
             raise RuntimeError(f"job {self._key!r} has no request payload to submit")
 
+        if self._mode == "interactive":
+            return self._submit_interactive()
+
+        if self._effective_strategy() == "speculative":
+            # Submit optimistically unless the deadline is already inside the
+            # cancel+re-issue window, in which case batch is pointless.
+            if not self._can_afford_to_wait():
+                return self._submit_interactive()
+            return self._submit_batch(strategy="speculative")
+
+        # conservative: decide once, here, using the worst-case turnaround margin.
         if self._should_use_interactive():
             return self._submit_interactive()
-        return self._submit_batch()
+        return self._submit_batch(strategy="conservative")
 
     def _submit_interactive(self):
         texts = []
@@ -221,7 +321,7 @@ class Job:
         self._save()
         return response
 
-    def _submit_batch(self):
+    def _submit_batch(self, *, strategy="conservative"):
         try:
             handle = providers.submit_batch(self._model, self._payload, **self._kw)
         except providers.TransientProviderError:
@@ -230,7 +330,13 @@ class Job:
         state = self._base_state()
         state.update(state=self.SENT, actual_mode="batch",
                      batch_job_id=handle.batch_job_id,
-                     input_file_id=handle.input_file_id)
+                     input_file_id=handle.input_file_id,
+                     fallback_strategy=strategy)
+        if strategy == "speculative":
+            # Persist enough to reconstruct and re-issue interactively from a
+            # later scheduled poll (the poller rebuilds Job with no payload/kwargs).
+            state["payload"] = self._payload
+            state["litellm_kwargs"] = dict(self._kw)
         self._state = state
         self._save()
         return None
@@ -247,6 +353,11 @@ class Job:
 
     def _poll(self):
         handle = self._batch_handle()
+        if self._state.get("fallback_strategy") == "speculative":
+            return self._poll_speculative(handle)
+        return self._poll_conservative(handle)
+
+    def _poll_conservative(self, handle):
         result = providers.poll_batch(handle)
 
         if result.status in ("pending", "transient_error"):
@@ -256,12 +367,14 @@ class Job:
             self._save()
             return None
 
-        if result.status == "failed":
+        if result.status in ("failed", "canceled"):
             self._mark_failed(result.error_message, handle, result.output_file_id)
             raise BatchJobFailed(result.error_message or "batch failed",
                                  handle.batch_job_id)
 
-        # completed
+        return self._finish_completed(handle, result)
+
+    def _finish_completed(self, handle, result):
         response = result.texts if self._is_bundle else result.texts[0]
         self._state.update(
             state=self.COMPLETED, response=response, completed_at=_now_iso(),
@@ -274,6 +387,107 @@ class Job:
                 providers.cleanup(handle)
             except Exception:
                 pass  # best-effort; result already durably saved
+        return response
+
+    def _poll_speculative(self, handle):
+        result = providers.poll_batch(handle)
+
+        if result.status == "completed":
+            return self._finish_completed(handle, result)
+
+        if result.status in ("failed", "canceled"):
+            # We have not requested a cancel yet, so 'canceled' means it was
+            # cancelled out of band → treat as a failure.
+            self._mark_failed(result.error_message, handle, result.output_file_id)
+            raise BatchJobFailed(result.error_message or "batch failed",
+                                 handle.batch_job_id)
+
+        # pending or transient_error → still working
+        self._state["poll_attempts"] = self._state.get("poll_attempts", 0) + 1
+        if result.status == "transient_error":
+            self._state["error_message"] = result.error_message
+            self._save()
+            return None
+
+        if self._can_afford_to_wait():
+            self._save()
+            return None
+
+        # Out of time: initiate cancel and hand off to CANCEL_REQUESTED. Do NOT
+        # wait for it to take effect — the next scheduled poll resolves it.
+        # Safe to re-cancel if we crash before the save below: a repeat cancel_batch on an already-cancelling job is idempotent (no fee).
+        try:
+            providers.cancel(handle)
+        except providers.TransientProviderError:
+            self._save()  # cancel failed transiently; retry next poll, stay SENT
+            return None
+        self._state["state"] = self.CANCEL_REQUESTED
+        self._state["cancel_requested_at"] = _now_iso()
+        self._save()
+        return None
+
+    def _cancel_resolution_expired(self) -> bool:
+        stamped = _parse_iso(self._state.get("cancel_requested_at"))
+        if stamped is None:
+            return False
+        timeout_h = self._cancel_resolution_timeout_h
+        if timeout_h is None:
+            timeout_h = _default_cancel_resolution_timeout(self._provider())
+        elapsed_h = (_now() - stamped).total_seconds() / 3600.0
+        return elapsed_h >= timeout_h
+
+    def _poll_cancel(self):
+        handle = self._batch_handle()
+        result = providers.poll_batch(handle)
+
+        if result.status == "completed":
+            # Finished before the cancel took effect → salvage the batch result.
+            return self._finish_completed(handle, result)
+
+        if result.status == "canceled":
+            return self._reissue_interactive(handle)
+
+        if result.status == "failed":
+            self._mark_failed(result.error_message, handle, result.output_file_id)
+            raise BatchJobFailed(result.error_message or "batch failed",
+                                 handle.batch_job_id)
+
+        # pending / transient_error: cancel not yet effective.
+        self._state["poll_attempts"] = self._state.get("poll_attempts", 0) + 1
+        if result.status == "transient_error":
+            self._state["error_message"] = result.error_message
+        if self._cancel_resolution_expired():
+            # Stop waiting on a cancel that won't settle (e.g. Vertex best-effort).
+            return self._reissue_interactive(handle)
+        self._save()
+        return None
+
+    def _reissue_interactive(self, handle):
+        """Re-run the persisted request interactively and mark COMPLETED."""
+        texts = []
+        usage = dict(_ZERO_USAGE)
+        cost = dict(_ZERO_COST)
+        try:
+            for messages in self._payload:
+                cr = providers.complete(self._model, messages, **self._kw)
+                texts.append(cr.text)
+                _accumulate(usage, cr.usage)
+                _accumulate_cost(cost, cr.cost)
+        except providers.TransientProviderError:
+            self._save()  # stay CANCEL_REQUESTED; retry interactive next poll
+            return None
+
+        response = texts if self._is_bundle else texts[0]
+        self._state.update(
+            state=self.COMPLETED, actual_mode="interactive",
+            completed_at=_now_iso(), response=response, usage=usage, cost=cost,
+            error_message=None)
+        self._save()
+        if self._cleanup:
+            try:
+                providers.cleanup(handle)  # remove the (cancelled) batch artifacts
+            except Exception:
+                pass
         return response
 
     def _mark_failed(self, message, handle=None, output_file_id=None):

@@ -19,6 +19,15 @@ from llm_batch.errors import TransientProviderError
 # All three providers apply ~50% independent of batch size (see spec §10).
 BATCH_RATE = 0.5
 
+# Providers whose batch jobs litellm can cancel (litellm>=1.83.0 adds Vertex).
+# Anthropic and gemini are absent: they fall back to the conservative strategy.
+_CANCELLABLE = {"openai", "azure", "vertex_ai"}
+
+
+def provider_supports_cancel(provider: str) -> bool:
+    """True iff litellm.cancel_batch can cancel a batch for this provider."""
+    return provider in _CANCELLABLE
+
 # litellm error status codes / type-name fragments treated as retryable.
 _TRANSIENT_STATUS = {408, 409, 429, 500, 502, 503, 504}
 _TRANSIENT_NAME_FRAGMENTS = (
@@ -43,7 +52,7 @@ class BatchHandle:
 class PollResult:
     """Outcome of one poll of a batch job."""
 
-    status: str  # "pending" | "completed" | "failed" | "transient_error"
+    status: str  # "pending" | "completed" | "failed" | "transient_error" | "canceled"
     texts: list[str] | None = None
     usage: dict | None = None
     cost: dict | None = None
@@ -156,6 +165,25 @@ def submit_batch(model: str, requests: list, **kw) -> BatchHandle:
     )
 
 
+def cancel(handle: BatchHandle) -> None:
+    """Initiate cancellation of a batch job and return immediately.
+
+    Delegates to litellm for all providers (OpenAI/Azure/Vertex). Does NOT wait
+    for the cancel to take effect — the outcome is observed by a later poll_batch
+    (the job transitions through CANCEL_REQUESTED). Transient errors are wrapped so
+    the caller can leave the job in place and retry on the next scheduled poll.
+    """
+    try:
+        litellm.cancel_batch(
+            batch_id=handle.batch_job_id,
+            custom_llm_provider=handle.provider,
+        )
+    except Exception as exc:
+        if _is_transient(exc):
+            raise TransientProviderError(str(exc)) from exc
+        raise
+
+
 def complete(model: str, messages: list, **kw) -> CompletionResult:
     """Interactive path: one immediate completion with usage + cost."""
     try:
@@ -189,16 +217,20 @@ def _usage_dict(usage) -> dict:
     }
 
 
-# Provider batch statuses that mean "still working".
-_PENDING_STATUSES = {"validating", "in_progress", "finalizing"}
+# Provider batch statuses that mean "still working" — including an in-progress
+# cancellation, which is non-terminal (we keep polling until it settles).
+_PENDING_STATUSES = {"validating", "in_progress", "finalizing", "canceling", "cancelling"}
+# Provider batch statuses that mean "the job was cancelled" (terminal). Reported
+# distinctly from failure so the speculative state machine can re-issue interactively.
+_CANCELED_STATUSES = {"cancelled", "canceled"}
 # Provider batch statuses that mean "terminally dead".
-_FAILED_STATUSES = {"failed", "expired", "cancelled", "canceling", "cancelling"}
+_FAILED_STATUSES = {"failed", "expired"}
 
 
 def poll_batch(handle: BatchHandle) -> PollResult:
     """Poll one batch job once and classify the outcome.
 
-    Returns a PollResult with status pending | completed | failed | transient_error.
+    Returns a PollResult with status pending | completed | failed | transient_error | canceled.
     Transient errors (429/timeout/5xx) never become `failed` — the Job keeps
     polling (spec §8.1).
     """
@@ -214,6 +246,11 @@ def poll_batch(handle: BatchHandle) -> PollResult:
     status = getattr(batch, "status", None)
     if status in _PENDING_STATUSES:
         return PollResult(status="pending")
+    if status in _CANCELED_STATUSES:
+        return PollResult(
+            status="canceled",
+            error_message=f"batch {handle.batch_job_id} reported status={status}",
+        )
     if status in _FAILED_STATUSES:
         return PollResult(
             status="failed",

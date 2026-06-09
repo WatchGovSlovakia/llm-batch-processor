@@ -17,12 +17,20 @@ class Pipeline:
 
     def __init__(self, state_dir, *, mode="batch", deadline=None,
                  time_budget_hours=None, max_batch_turnaround_hours=24,
-                 rerun_cmd=None, storage=None, cleanup_provider_files=True):
+                 rerun_cmd=None, storage=None, cleanup_provider_files=True,
+                 fallback_strategy="conservative", poll_interval_hours=1.0,
+                 interactive_runtime_estimate_hours=0.25,
+                 cancel_margin_hours=None, cancel_resolution_timeout_hours=None):
         self._state_dir = state_dir
         self._mode = mode
         self._max_turnaround = max_batch_turnaround_hours
         self._rerun_cmd = rerun_cmd
         self._cleanup = cleanup_provider_files
+        self._fallback_strategy = fallback_strategy
+        self._poll_interval_h = poll_interval_hours
+        self._interactive_estimate_h = interactive_runtime_estimate_hours
+        self._cancel_margin_h = cancel_margin_hours
+        self._cancel_resolution_timeout_h = cancel_resolution_timeout_hours
         self._backend = storage if storage is not None else FileStorage(state_dir)
         self._meta = self._load_or_init_meta(deadline, time_budget_hours)
         self._deadline = self._meta.get("deadline")
@@ -62,6 +70,11 @@ class Pipeline:
             mode=self._mode, deadline=self._deadline,
             max_batch_turnaround_hours=self._max_turnaround,
             rerun_cmd=self._rerun_cmd, cleanup_provider_files=self._cleanup,
+            fallback_strategy=self._fallback_strategy,
+            poll_interval_hours=self._poll_interval_h,
+            interactive_runtime_estimate_hours=self._interactive_estimate_h,
+            cancel_margin_hours=self._cancel_margin_h,
+            cancel_resolution_timeout_hours=self._cancel_resolution_timeout_h,
             **litellm_kwargs)
 
     def cost_summary(self) -> dict:

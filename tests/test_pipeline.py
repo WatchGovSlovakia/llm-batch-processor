@@ -86,3 +86,23 @@ def test_save_meta_deadline_propagates_to_jobs(tmp_path, fake_providers):
     job = p.job("x", messages=[{"role": "user", "content": "hi"}], model="gpt-4o")
     job.execute()
     assert job.snapshot()["actual_mode"] == "interactive"
+
+
+def test_pipeline_threads_speculative_config_to_jobs(tmp_path):
+    from llm_batch.pipeline import Pipeline
+    p = Pipeline(str(tmp_path), fallback_strategy="speculative",
+                 poll_interval_hours=2.0, interactive_runtime_estimate_hours=0.5,
+                 cancel_margin_hours=0.4, cancel_resolution_timeout_hours=3.0)
+    job = p.job("k", messages=[{"role": "user", "content": "hi"}], model="gpt-4o")
+    assert job._fallback_strategy == "speculative"
+    assert job._poll_interval_h == 2.0
+    assert job._interactive_estimate_h == 0.5
+    assert job._cancel_margin_h == 0.4
+    assert job._cancel_resolution_timeout_h == 3.0
+
+
+def test_pipeline_defaults_to_conservative(tmp_path):
+    from llm_batch.pipeline import Pipeline
+    p = Pipeline(str(tmp_path))
+    job = p.job("k", messages=[{"role": "user", "content": "hi"}], model="gpt-4o")
+    assert job._fallback_strategy == "conservative"

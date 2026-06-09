@@ -57,6 +57,17 @@ sent, and returns the stored result once complete. Exit codes for cron:
   (default 24h), in which case it transparently runs interactively so the hard
   deadline is still met. Pass `time_budget_hours=` as sugar for a relative deadline.
 
+### Fallback strategies
+
+`fallback_strategy` (on `Pipeline`/`Job`) controls how a near-deadline batch job avoids missing its deadline:
+
+- `"conservative"` (default) — decide once at submit time: if `deadline − now < max_batch_turnaround_hours`, run interactively instead of batching. Safe, but forgoes the batch discount within a day or two of the deadline.
+- `"speculative"` — submit the batch optimistically and only cancel + re-run interactively at the last responsible moment, dropping the effective margin to roughly `poll_interval + cancel_margin + interactive_runtime_estimate`. Captures the discount in the common (fast) case.
+
+Speculative cancellation is delegated to litellm and supported for **OpenAI, Azure, and Vertex AI** (requires `litellm>=1.83.0`). For **Anthropic**, which litellm cannot cancel, a speculative job transparently degrades to `conservative` (with a one-time warning).
+
+Tuning knobs (all hours): `poll_interval_hours`, `interactive_runtime_estimate_hours`, `cancel_margin_hours` (provider-aware default), `cancel_resolution_timeout_hours` (provider-aware backstop for a cancel that never settles).
+
 ## Cron / polling
 
 Two patterns, one core:
