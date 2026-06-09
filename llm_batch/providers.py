@@ -19,6 +19,15 @@ from llm_batch.errors import TransientProviderError
 # All three providers apply ~50% independent of batch size (see spec §10).
 BATCH_RATE = 0.5
 
+# Providers whose batch jobs litellm can cancel (litellm>=1.83.0 adds Vertex).
+# Anthropic and gemini are absent: they fall back to the conservative strategy.
+_CANCELLABLE = {"openai", "azure", "vertex_ai"}
+
+
+def provider_supports_cancel(provider: str) -> bool:
+    """True iff litellm.cancel_batch can cancel a batch for this provider."""
+    return provider in _CANCELLABLE
+
 # litellm error status codes / type-name fragments treated as retryable.
 _TRANSIENT_STATUS = {408, 409, 429, 500, 502, 503, 504}
 _TRANSIENT_NAME_FRAGMENTS = (

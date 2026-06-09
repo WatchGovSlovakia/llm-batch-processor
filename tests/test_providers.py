@@ -301,3 +301,12 @@ def test_poll_batch_complete_bundle_with_expected_count(litellm_mock):
     result = providers.poll_batch(handle)
     assert result.status == "completed"
     assert result.texts == ["a", "b"]
+
+
+def test_provider_supports_cancel():
+    from llm_batch import providers
+    assert providers.provider_supports_cancel("openai") is True
+    assert providers.provider_supports_cancel("azure") is True
+    assert providers.provider_supports_cancel("vertex_ai") is True
+    assert providers.provider_supports_cancel("anthropic") is False
+    assert providers.provider_supports_cancel("gemini") is False
