@@ -321,7 +321,7 @@ def test_poll_batch_cancelled_is_distinct_status(litellm_mock):
     assert result.status == "canceled"
 
 
-def test_poll_batch_canceling_is_pending(litellm_mock):
+def test_poll_batch_cancelling_is_pending(litellm_mock):
     from llm_batch import providers
     from llm_batch.providers import BatchHandle
     litellm_mock.retrieve_batch = lambda **k: make_obj(status="cancelling")

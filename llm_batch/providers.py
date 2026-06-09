@@ -211,7 +211,7 @@ _FAILED_STATUSES = {"failed", "expired"}
 def poll_batch(handle: BatchHandle) -> PollResult:
     """Poll one batch job once and classify the outcome.
 
-    Returns a PollResult with status pending | completed | failed | transient_error.
+    Returns a PollResult with status pending | completed | failed | transient_error | canceled.
     Transient errors (429/timeout/5xx) never become `failed` — the Job keeps
     polling (spec §8.1).
     """
