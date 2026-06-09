@@ -101,3 +101,87 @@ def _is_transient(exc: Exception) -> bool:
         return True
     name = type(exc).__name__.lower()
     return any(frag in name for frag in _TRANSIENT_NAME_FRAGMENTS)
+
+
+# Re-exported so tests/callers can reference providers.TransientProviderError.
+TransientProviderError = TransientProviderError
+
+
+def _build_jsonl(model: str, requests: list, **kw) -> str:
+    """One JSON line per request; custom_id req-0..req-N; kwargs merged into body."""
+    lines = []
+    for i, messages in enumerate(requests):
+        lines.append(json.dumps({
+            "custom_id": f"req-{i}",
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {"model": model, "messages": messages, **kw},
+        }))
+    return "\n".join(lines) + "\n"
+
+
+def submit_batch(model: str, requests: list, **kw) -> BatchHandle:
+    """Upload a JSONL of all requests and create a batch job.
+
+    `requests` is a list of message-lists (a single-request job passes a
+    one-element list). Extra kwargs (response_format, tools, temperature, ...)
+    are forwarded into each request body.
+    """
+    provider = provider_of(model)
+    try:
+        jsonl = _build_jsonl(model, requests, **kw)
+        file_obj = litellm.create_file(
+            file=("batch.jsonl", io.BytesIO(jsonl.encode()), "application/jsonl"),
+            purpose="batch",
+            custom_llm_provider=provider,
+        )
+        batch = litellm.create_batch(
+            completion_window="24h",
+            endpoint="/v1/chat/completions",
+            input_file_id=file_obj.id,
+            custom_llm_provider=provider,
+            model=model,
+        )
+    except Exception as exc:
+        if _is_transient(exc):
+            raise TransientProviderError(str(exc)) from exc
+        raise
+    return BatchHandle(
+        provider=provider,
+        model=model,
+        batch_job_id=batch.id,
+        input_file_id=file_obj.id,
+    )
+
+
+def complete(model: str, messages: list, **kw) -> CompletionResult:
+    """Interactive path: one immediate completion with usage + cost."""
+    try:
+        response = litellm.completion(model=model, messages=messages, **kw)
+    except Exception as exc:
+        if _is_transient(exc):
+            raise TransientProviderError(str(exc)) from exc
+        raise
+    text = response.choices[0].message.content
+    usage = _usage_dict(response.usage)
+    cost = _cost_dict(model, usage, batch=False)
+    return CompletionResult(text=text, usage=usage, cost=cost)
+
+
+def _usage_dict(usage) -> dict:
+    """Normalize a litellm usage object (or dict) into a plain dict."""
+    if usage is None:
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    if isinstance(usage, dict):
+        src = usage
+    else:
+        src = {
+            "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+            "completion_tokens": getattr(usage, "completion_tokens", 0),
+            "total_tokens": getattr(usage, "total_tokens", 0),
+        }
+    return {
+        "prompt_tokens": src.get("prompt_tokens", 0),
+        "completion_tokens": src.get("completion_tokens", 0),
+        "total_tokens": src.get("total_tokens", 0),
+    }
