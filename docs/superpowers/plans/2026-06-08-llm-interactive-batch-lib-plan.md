@@ -534,7 +534,10 @@ class FileStorage:
         self._dir = directory
 
     def for_job(self, key: str) -> _FileJobHandle:
-        return _FileJobHandle(os.path.join(self._dir, f"{key}.json"))
+        # Auto-load so a freshly-minted handle reflects any persisted state.
+        handle = _FileJobHandle(os.path.join(self._dir, f"{key}.json"))
+        handle.load()
+        return handle
 
     def for_meta(self) -> _FileJobHandle:
         return _FileJobHandle(os.path.join(self._dir, META_FILENAME))
