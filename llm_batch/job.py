@@ -37,6 +37,22 @@ def _parse_iso(value: str | None) -> datetime | None:
 _ZERO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 _ZERO_COST = {"charged_usd": 0.0, "interactive_usd": 0.0, "saved_usd": 0.0}
 
+# Provider-aware timing defaults (hours), used when the caller leaves the knob None.
+_SAFETY_HOURS = 0.1
+_DEFAULT_CANCEL_MARGIN_HOURS = {"openai": 0.25, "azure": 0.25, "vertex_ai": 0.5}
+_FALLBACK_CANCEL_MARGIN_HOURS = 0.5
+_DEFAULT_CANCEL_RESOLUTION_HOURS = {"openai": 0.5, "azure": 0.5, "vertex_ai": 2.0}
+_FALLBACK_CANCEL_RESOLUTION_HOURS = 2.0
+
+
+def _default_cancel_margin(provider: str) -> float:
+    return _DEFAULT_CANCEL_MARGIN_HOURS.get(provider, _FALLBACK_CANCEL_MARGIN_HOURS)
+
+
+def _default_cancel_resolution_timeout(provider: str) -> float:
+    return _DEFAULT_CANCEL_RESOLUTION_HOURS.get(provider, _FALLBACK_CANCEL_RESOLUTION_HOURS)
+
+
 # Fields reconstructed from storage when resuming a job.
 _PERSISTED_FIELDS = (
     "key", "state", "mode", "model", "n_requests", "bundle", "batch_job_id",
@@ -175,6 +191,32 @@ class Job:
                           self._state.get("output_file_id"))
 
     # --- internals ------------------------------------------------------
+
+    def _provider(self) -> str:
+        return providers.provider_of(self._model)
+
+    def _speculative_window_hours(self) -> float:
+        """Minimum slack the deadline must have to risk waiting one more poll."""
+        margin = self._cancel_margin_h
+        if margin is None:
+            margin = _default_cancel_margin(self._provider())
+        return (self._poll_interval_h + margin
+                + self._interactive_estimate_h + _SAFETY_HOURS)
+
+    def _hours_remaining(self) -> float | None:
+        if self._deadline is None:
+            return None
+        deadline_dt = _parse_iso(self._deadline)
+        if deadline_dt is None:
+            return None
+        return (deadline_dt - _now()).total_seconds() / 3600.0
+
+    def _can_afford_to_wait(self) -> bool:
+        """True if the deadline leaves room to wait for the next scheduled poll."""
+        remaining = self._hours_remaining()
+        if remaining is None:
+            return True
+        return remaining >= self._speculative_window_hours()
 
     def _should_use_interactive(self) -> bool:
         if self._mode == "interactive":

@@ -6,7 +6,7 @@ from llm_batch import job as job_module
 from llm_batch.job import Job, _now
 from llm_batch.providers import BatchHandle, CompletionResult, PollResult
 from llm_batch.storage.file import FileStorage
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 
 @pytest.fixture(autouse=True)
@@ -51,3 +51,28 @@ def test_speculative_batch_persists_payload_and_strategy(tmp_path, monkeypatch):
     reloaded = Job(FileStorage(str(tmp_path)).for_job("x"))
     assert reloaded._payload == [[{"role": "user", "content": "hi"}]]
     assert reloaded._kw == {"temperature": 0.2}
+
+
+def test_can_afford_to_wait_decision(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
+    # window = poll_interval(1.0) + cancel_margin(openai default 0.25)
+    #          + interactive_estimate(0.25) + safety(0.1) = 1.6h
+    job = _spec_job(tmp_path, deadline=(_now() + timedelta(hours=3)).isoformat())
+    assert job._can_afford_to_wait() is True
+
+    tight = _spec_job(tmp_path, key="y",
+                      deadline=(_now() + timedelta(hours=1)).isoformat())
+    assert tight._can_afford_to_wait() is False
+
+
+def test_can_afford_to_wait_no_deadline_is_true(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
+    job = _spec_job(tmp_path, deadline=None)
+    assert job._can_afford_to_wait() is True
+
+
+def test_cancel_margin_default_is_provider_aware(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "vertex_ai")
+    job = _spec_job(tmp_path, model="vertex_ai/gemini-1.5-pro")
+    # vertex default margin 0.5 → window = 1.0 + 0.5 + 0.25 + 0.1 = 1.85h
+    assert job._speculative_window_hours() == pytest.approx(1.85)
