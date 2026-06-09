@@ -8,6 +8,25 @@ captures the design for the `speculative` strategy so it can be implemented late
 §8 failure handling, §9 provider layer). Provider research with a "Batch Cancellation" section
 each: `docs/research/{openai,gemini,claude}-batch.md`.
 
+## Architecture Decision: Cancellation via litellm (2026-06-09)
+
+Cancellation is **delegated entirely to litellm**; we add **no native provider-SDK cancel code**
+to this repo. `providers.py` stays litellm-only.
+
+- litellm's `cancel_batch` / `acancel_batch` now route **OpenAI, Azure, and Vertex AI**. Vertex was
+  added by merged PR https://github.com/BerriAI/litellm/pull/23957 (merge commit `8d843fd`). This
+  closes the Vertex gap the original draft of this doc called out.
+- **Anthropic batch cancellation is not supported in litellm** and nobody upstream is working on it
+  (issues + PRs checked 2026-06-09: `cancel_batch` routes only OpenAI/Azure/Vertex; Anthropic's
+  handler implements `retrieve_batch` only, no cancel). We are **not** contributing it upstream as
+  part of this work.
+- ⇒ The `speculative` strategy is offered **only for cancellable providers**
+  (`_CANCELLABLE = {"openai", "azure", "vertex_ai"}`). For Anthropic, a job configured with
+  `fallback_strategy="speculative"` **transparently degrades to `conservative`** (the existing
+  24h-window fallback) and emits a **one-time WARNING** the first time a downgrade happens, so the
+  user knows speculative is not taking effect for that provider. Mixed-provider runs therefore work
+  uncomplaining: speculative applies where supported, conservative elsewhere.
+
 ## Motivation
 
 The MVP's `conservative` strategy falls back from batch to interactive whenever
@@ -40,6 +59,8 @@ At each poll of a `SENT` batch job under the `speculative` strategy:
 
 This "initiate, then poll until canceled-or-finished" loop is the crux of why this is deferred:
 it needs careful state handling and real testing against each provider's cancellation behavior.
+(The original "per-provider cancel dispatch" reason is now gone — litellm handles dispatch for
+OpenAI/Azure/Vertex; see Architecture Decision. What remains is the state-machine + race handling.)
 
 ## Cost Findings (already researched — see research files)
 
@@ -54,34 +75,54 @@ Submit-then-cancel is **essentially free** on all three providers:
 
 1. **Cancellation latency, no uniform SLA.**
    - OpenAI: up to ~10 min (`cancelling` → `cancelled`).
-   - Anthropic: seconds–minutes; in-flight requests are allowed to finish.
    - **Vertex AI: best-effort, no documented bound** — the job may even complete despite the
      cancel. This is why step 3b polls until a terminal state and step 3c salvages a finished job.
+   - Anthropic: not applicable — we never cancel Anthropic (it uses conservative). Latency recorded
+     in research only: seconds–minutes, in-flight requests allowed to finish.
    - ⇒ `cancel_margin` must be conservative and provider-aware (e.g. default ≥15–30 min).
 
-2. **litellm cannot cancel Vertex or Anthropic batches.**
-   - `litellm.cancel_batch` / `acancel_batch` support **OpenAI/Azure only**.
-   - Vertex must be cancelled via the Vertex SDK
-     (`aiplatform.gapic.JobServiceClient.cancel_batch_prediction_job`) or REST
-     (`projects.locations.batchPredictionJobs.cancel`).
-   - Anthropic must be cancelled via the native SDK (`client.messages.batches.cancel(batch_id)`)
-     or `POST /v1/messages/batches/{id}/cancel`.
-   - ⇒ The provider layer's `cancel()` must dispatch per provider; only OpenAI can delegate to
-     litellm. This is the main reason for the extra implementation + testing.
+2. **Anthropic cannot be cancelled via litellm (so speculative is unavailable there).**
+   - litellm's `cancel_batch` / `acancel_batch` route **OpenAI, Azure, and Vertex AI** only.
+   - Cancelling Anthropic would require native-SDK code (`client.messages.batches.cancel(batch_id)`
+     / `POST /v1/messages/batches/{id}/cancel`), which we have decided **not** to add (see
+     Architecture Decision above).
+   - ⇒ No per-provider dispatch in our `cancel()`: it is a thin `litellm.acancel_batch` wrapper, and
+     Anthropic jobs simply never enter the speculative path.
 
 ## New Configuration Required
 
-- `fallback_strategy: "conservative" | "speculative"` (MVP default `"conservative"`).
+- `fallback_strategy: "conservative" | "speculative"` (MVP default `"conservative"`). Global knob,
+  not per-call. When `"speculative"` is set, it only takes effect for cancellable providers; a job
+  on a non-cancellable provider (Anthropic) is downgraded to `"conservative"` with a one-time
+  WARNING (see Architecture Decision).
 - `poll_interval` — expected time between poller runs (e.g. 1h); the speculative decision needs it.
 - `interactive_runtime_estimate` — estimated time to run this job interactively (larger for big
   bundles); caller-configurable with a default.
-- `cancel_margin` — conservative upper bound on cancellation latency; provider-aware default.
+- `cancel_margin` — conservative upper bound on cancellation latency; provider-aware default, and
+  only consulted for cancellable providers. OpenAI ~10 min; Vertex conservative (≥15–30 min) given
+  its best-effort/unbounded cancel.
 
 ## Provider Layer Additions
 
-- Add `cancel(handle) -> None` and reuse `poll_batch(handle)` to watch for `canceled`/`completed`.
-- `cancel()` dispatch: OpenAI via litellm; Vertex via Vertex SDK; Anthropic via native SDK.
-- Map provider cancel states to the algorithm's `canceled` / `finished` outcomes.
+- Add `provider_supports_cancel(provider) -> bool` backed by
+  `_CANCELLABLE = {"openai", "azure", "vertex_ai"}`. The strategy selector consults this to gate
+  the speculative path (and to trigger the one-time Anthropic→conservative downgrade warning).
+- Add `cancel(handle) -> None` that delegates to
+  `litellm.acancel_batch(batch_id=handle.batch_job_id, custom_llm_provider=handle.provider)` —
+  **no per-provider SDK branching**. Reuse the existing `poll_batch(handle)` to watch for
+  `canceled`/`completed`. (`poll_batch` already maps `cancelled`/`canceling` into `_FAILED_STATUSES`;
+  the speculative loop reads that plus `completed` to drive steps 3b–3d.)
+- Map provider cancel states to the algorithm's `canceled` / `finished` outcomes. Vertex's cancel is
+  best-effort with no bound (it may even complete despite the cancel), so the "poll until
+  canceled-or-finished" loop and the finished-before-cancel salvage (algorithm step 3c) remain
+  essential — delegation to litellm does not remove this requirement.
+
+## Dependency: litellm Vertex-cancel capability
+
+The installed litellm must include PR #23957 (Vertex `cancel_batch` support). Rather than pin a
+brittle version, verify the capability at startup/CI: assert `litellm.acancel_batch` accepts
+`custom_llm_provider="vertex_ai"` without raising "unsupported provider". If it does not, treat
+Vertex like Anthropic (no speculative; conservative fallback) until litellm is upgraded.
 
 ## Testing Notes
 
@@ -90,3 +131,8 @@ Submit-then-cancel is **essentially free** on all three providers:
   (step 3d).
 - Live tests (opt-in) should exercise real cancellation latency per provider, especially Vertex's
   unbounded case.
+- Unit-test the provider gating: `provider_supports_cancel` returns the right set, an Anthropic job
+  under `speculative` is downgraded to `conservative`, and the downgrade WARNING is emitted exactly
+  once (not per poll).
+- Unit-test that `cancel()` calls `litellm.acancel_batch` with the right `custom_llm_provider` and
+  does not import any native provider SDK.
