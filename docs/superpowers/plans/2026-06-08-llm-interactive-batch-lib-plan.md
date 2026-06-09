@@ -1399,7 +1399,7 @@ def fake_providers(monkeypatch):
     return calls
 
 
-def _handle(tmp_path, key="ocr"):
+def _handle(tmp_path, key="x"):
     return FileStorage(str(tmp_path)).for_job(key)
 
 
