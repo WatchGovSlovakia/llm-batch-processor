@@ -147,6 +147,11 @@ class Job:
         self._state["error_message"] = None
         self._save()
 
+    def mark_failed(self, message: str) -> None:
+        """Force this job to FAILED and attempt provider cleanup (poller use)."""
+        self._mark_failed(message, self._batch_handle(),
+                          self._state.get("output_file_id"))
+
     # --- internals ------------------------------------------------------
 
     def _should_use_interactive(self) -> bool:
