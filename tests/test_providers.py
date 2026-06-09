@@ -310,3 +310,21 @@ def test_provider_supports_cancel():
     assert providers.provider_supports_cancel("vertex_ai") is True
     assert providers.provider_supports_cancel("anthropic") is False
     assert providers.provider_supports_cancel("gemini") is False
+
+
+def test_poll_batch_cancelled_is_distinct_status(litellm_mock):
+    from llm_batch import providers
+    from llm_batch.providers import BatchHandle
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="cancelled")
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1")
+    result = providers.poll_batch(handle)
+    assert result.status == "canceled"
+
+
+def test_poll_batch_canceling_is_pending(litellm_mock):
+    from llm_batch import providers
+    from llm_batch.providers import BatchHandle
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="cancelling")
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1")
+    result = providers.poll_batch(handle)
+    assert result.status == "pending"

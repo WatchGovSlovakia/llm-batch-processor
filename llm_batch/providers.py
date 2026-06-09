@@ -198,10 +198,14 @@ def _usage_dict(usage) -> dict:
     }
 
 
-# Provider batch statuses that mean "still working".
-_PENDING_STATUSES = {"validating", "in_progress", "finalizing"}
+# Provider batch statuses that mean "still working" — including an in-progress
+# cancellation, which is non-terminal (we keep polling until it settles).
+_PENDING_STATUSES = {"validating", "in_progress", "finalizing", "canceling", "cancelling"}
+# Provider batch statuses that mean "the job was cancelled" (terminal). Reported
+# distinctly from failure so the speculative state machine can re-issue interactively.
+_CANCELED_STATUSES = {"cancelled", "canceled"}
 # Provider batch statuses that mean "terminally dead".
-_FAILED_STATUSES = {"failed", "expired", "cancelled", "canceling", "cancelling"}
+_FAILED_STATUSES = {"failed", "expired"}
 
 
 def poll_batch(handle: BatchHandle) -> PollResult:
@@ -223,6 +227,11 @@ def poll_batch(handle: BatchHandle) -> PollResult:
     status = getattr(batch, "status", None)
     if status in _PENDING_STATUSES:
         return PollResult(status="pending")
+    if status in _CANCELED_STATUSES:
+        return PollResult(
+            status="canceled",
+            error_message=f"batch {handle.batch_job_id} reported status={status}",
+        )
     if status in _FAILED_STATUSES:
         return PollResult(
             status="failed",
