@@ -40,27 +40,50 @@ responsible moment, letting the effective deadline drop to roughly
 instead of 24–48h. This captures the discount in the common (fast) case and pays full interactive
 price only on the slow tail.
 
-## Cancellation Algorithm (as specified)
+## Cancellation Algorithm — non-blocking, scheduled-poll state machine
 
-At each poll of a `SENT` batch job under the `speculative` strategy:
+**Key constraint: never busy-wait.** The poller runs on a schedule (e.g. hourly via GitHub
+Actions). Initiating a cancel and then looping in-process until the provider reports a terminal
+state would burn Actions minutes idling. Instead, cancellation is **persisted as job state** and
+resolved across *subsequent scheduled poll runs* — each poll run does bounded work and exits.
 
-1. If the batch is **completed** → use the result, mark `COMPLETED` (no cancellation needed).
-2. Otherwise, evaluate the time budget. If we can still afford to wait for the next poll
+This adds one job state, `CANCEL_REQUESTED` (between `SENT` and a terminal state), plus a
+`cancel_requested_at` timestamp. The state machine, evaluated once per poll run per job:
+
+**A. Job is `SENT` (no cancel requested yet).**
+1. Poll the provider. If **completed** → use the result, mark `COMPLETED`. Done.
+2. Otherwise evaluate the time budget. If we can still afford to wait for the next scheduled poll
    (`deadline − now ≥ poll_interval + cancel_margin + interactive_runtime_estimate + safety`),
-   keep waiting → return pending.
-3. If we **cannot** afford to wait, cancel:
-   a. **Initiate cancel** at the provider.
-   b. **Poll the provider job state** until it returns `canceled` **or** `finished`/`completed`.
-   c. If it **finished** before the cancel took effect → **continue as if no cancellation**:
-      use the returned result, mark `COMPLETED`. (We already paid the batch rate for it; the
-      result is valid, so use it.)
-   d. If it is **canceled** → **re-issue the request as an interactive call**, store that result,
-      set `actual_mode = "interactive"`, mark `COMPLETED`.
+   return pending — re-check next run.
+3. If we **cannot** afford to wait: **initiate cancel** via `litellm.acancel_batch`, set state to
+   `CANCEL_REQUESTED`, stamp `cancel_requested_at`, and **return pending immediately** (do *not*
+   wait for the cancel to take effect). The outcome is read on the next scheduled poll.
 
-This "initiate, then poll until canceled-or-finished" loop is the crux of why this is deferred:
-it needs careful state handling and real testing against each provider's cancellation behavior.
-(The original "per-provider cancel dispatch" reason is now gone — litellm handles dispatch for
-OpenAI/Azure/Vertex; see Architecture Decision. What remains is the state-machine + race handling.)
+**B. Job is `CANCEL_REQUESTED` (cancel already initiated on an earlier run).** Poll the provider and
+branch on its state:
+- **completed** → the batch finished before the cancel took effect. **Salvage it**: use the result,
+  mark `COMPLETED`. (We already paid the batch rate; the result is valid.)
+- **cancelled** → **re-issue the request as an interactive call**, store that result, set
+  `actual_mode = "interactive"`, mark `COMPLETED`.
+- **still queued / in-progress / cancelling** (cancel not yet effective) → **return pending and wait
+  for the next scheduled poll.** Do not re-issue interactively yet — the batch may still complete or
+  finish cancelling, and re-issuing now risks a double charge / lost result. Seeing "queued" here
+  usually means cancellation hasn't propagated yet (more likely when `poll_interval` is short, e.g.
+  5 min; with hourly polling a terminal state is the common case).
+
+So the three provider states observed on a `CANCEL_REQUESTED` job map directly to: *queued* → keep
+waiting; *cancelled* → interactive re-issue; *completed* → salvage.
+
+**Why this is deferred:** it needs careful state handling (the new `CANCEL_REQUESTED` state + the
+finished-before-cancel race) and real testing against each provider's cancellation behavior. The
+original "per-provider cancel dispatch" reason is now gone — litellm handles dispatch for
+OpenAI/Azure/Vertex (see Architecture Decision).
+
+**Bounding the wait.** A `CANCEL_REQUESTED` job that never reaches a terminal state would otherwise
+poll forever. Bound it: if `now − cancel_requested_at` exceeds a `cancel_resolution_timeout`
+(provider-aware; generous for Vertex's unbounded cancel), stop waiting on the cancel and re-issue
+interactively so the caller still gets a result before/near the deadline. (If the batch later
+completes, `cleanup()` still removes its artifacts.)
 
 ## Cost Findings (already researched — see research files)
 
@@ -76,10 +99,12 @@ Submit-then-cancel is **essentially free** on all three providers:
 1. **Cancellation latency, no uniform SLA.**
    - OpenAI: up to ~10 min (`cancelling` → `cancelled`).
    - **Vertex AI: best-effort, no documented bound** — the job may even complete despite the
-     cancel. This is why step 3b polls until a terminal state and step 3c salvages a finished job.
+     cancel. This is why a `CANCEL_REQUESTED` job is resolved across scheduled polls (state B) and
+     the completed branch salvages a finished job, with `cancel_resolution_timeout` as the backstop.
    - Anthropic: not applicable — we never cancel Anthropic (it uses conservative). Latency recorded
      in research only: seconds–minutes, in-flight requests allowed to finish.
-   - ⇒ `cancel_margin` must be conservative and provider-aware (e.g. default ≥15–30 min).
+   - ⇒ `cancel_margin` must be conservative and provider-aware (e.g. default ≥15–30 min). Because we
+     never busy-wait, the practical resolution granularity is also bounded below by `poll_interval`.
 
 2. **Anthropic cannot be cancelled via litellm (so speculative is unavailable there).**
    - litellm's `cancel_batch` / `acancel_batch` route **OpenAI, Azure, and Vertex AI** only.
@@ -101,21 +126,28 @@ Submit-then-cancel is **essentially free** on all three providers:
 - `cancel_margin` — conservative upper bound on cancellation latency; provider-aware default, and
   only consulted for cancellable providers. OpenAI ~10 min; Vertex conservative (≥15–30 min) given
   its best-effort/unbounded cancel.
+- `cancel_resolution_timeout` — provider-aware backstop for a `CANCEL_REQUESTED` job that never
+  reaches a terminal state. Once `now − cancel_requested_at` exceeds it, stop waiting on the cancel
+  and re-issue interactively (state B). Generous for Vertex (unbounded cancel); tighter for OpenAI.
 
 ## Provider Layer Additions
 
 - Add `provider_supports_cancel(provider) -> bool` backed by
   `_CANCELLABLE = {"openai", "azure", "vertex_ai"}`. The strategy selector consults this to gate
   the speculative path (and to trigger the one-time Anthropic→conservative downgrade warning).
-- Add `cancel(handle) -> None` that delegates to
-  `litellm.acancel_batch(batch_id=handle.batch_job_id, custom_llm_provider=handle.provider)` —
-  **no per-provider SDK branching**. Reuse the existing `poll_batch(handle)` to watch for
-  `canceled`/`completed`. (`poll_batch` already maps `cancelled`/`canceling` into `_FAILED_STATUSES`;
-  the speculative loop reads that plus `completed` to drive steps 3b–3d.)
-- Map provider cancel states to the algorithm's `canceled` / `finished` outcomes. Vertex's cancel is
-  best-effort with no bound (it may even complete despite the cancel), so the "poll until
-  canceled-or-finished" loop and the finished-before-cancel salvage (algorithm step 3c) remain
-  essential — delegation to litellm does not remove this requirement.
+- Add `cancel(handle) -> None` that **only initiates** the cancel via
+  `litellm.acancel_batch(batch_id=handle.batch_job_id, custom_llm_provider=handle.provider)` and
+  returns — **no per-provider SDK branching, and no wait loop**. The outcome is read by a later
+  scheduled `poll_batch`.
+- **`poll_batch` must distinguish `canceled` from `failed`.** Today it folds `cancelled`/`canceling`
+  into `_FAILED_STATUSES` (returns `failed`), which is correct for a non-speculative job but wrong
+  for a `CANCEL_REQUESTED` one, where `canceled` is the *expected* outcome that triggers interactive
+  re-issue. Add a distinct `canceled` poll status (or a speculative-aware poll) so state B can branch
+  `queued → wait`, `canceled → re-issue`, `completed → salvage`. `canceling`/`queued`/`in_progress`
+  stay non-terminal (keep waiting).
+- Vertex's cancel is best-effort with no bound (it may even complete despite the cancel), so the
+  cross-poll resolution (state B) and the finished-before-cancel salvage remain essential — and the
+  `cancel_resolution_timeout` backstop bounds the pathological never-terminal case.
 
 ## Dependency: litellm Vertex-cancel capability
 
@@ -126,9 +158,16 @@ Vertex like Anthropic (no speculative; conservative fallback) until litellm is u
 
 ## Testing Notes
 
-- Unit-test the speculative decision math (wait vs. cancel) with mocked clocks and `poll_interval`.
-- Mock the "finished-before-cancel" race (step 3c) and the "canceled → interactive re-issue" path
-  (step 3d).
+- Unit-test the state-A decision math (wait vs. cancel) with mocked clocks and `poll_interval`.
+- Unit-test the state-B branching across separate poll runs: `completed` → salvage; `cancelled` →
+  interactive re-issue (`actual_mode="interactive"`); `queued`/`canceling` → stays pending and waits
+  for the next run.
+- Assert **no busy-wait**: `cancel()` initiates and returns; a single poll run does bounded work and
+  does not loop until terminal. (e.g. spy on the provider client — at most one state read per job
+  per run.)
+- Unit-test the `cancel_resolution_timeout` backstop: a `CANCEL_REQUESTED` job stuck non-terminal
+  past the timeout re-issues interactively rather than waiting forever.
+- Unit-test that `poll_batch` reports `canceled` distinctly from `failed` for a cancelled batch.
 - Live tests (opt-in) should exercise real cancellation latency per provider, especially Vertex's
   unbounded case.
 - Unit-test the provider gating: `provider_supports_cancel` returns the right set, an Anthropic job

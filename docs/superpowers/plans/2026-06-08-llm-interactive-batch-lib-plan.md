@@ -3228,7 +3228,7 @@ git commit -m "feat: public exports, end-to-end integration test, and README"
 
 **3. Type consistency** — `BatchHandle`/`PollResult`/`CompletionResult` field names are used identically in `providers.py` (Tasks 4–7) and `job.py` (Task 8). `Storage` handle methods (`load/save/get/snapshot/finish`) match across `FileStorage` (3), `PostgresStorage` (14), and their consumers (`Job`, `Pipeline`, `Poller`). `provider_of` / `cleanup` / `cleanup_orphans` signatures match between `providers.py` and `poller.py`. Job state constants (`NOT_SENT/SENT/COMPLETED/FAILED`) are referenced consistently.
 
-**Out of scope (correctly absent):** no `litellm.cancel_batch`, no speculative cancellation — deferred to Phase 2 per `docs/todo/2026-06-08-canceling-batch-jobs.md`.
+**Out of scope (correctly absent):** no `litellm.cancel_batch`, no speculative cancellation — deferred to Phase 2 per `docs/superpowers/specs/2026-06-08-canceling-batch-jobs-design.md`.
 
 ---
 
