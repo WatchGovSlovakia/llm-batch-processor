@@ -185,3 +185,80 @@ def _usage_dict(usage) -> dict:
         "completion_tokens": src.get("completion_tokens", 0),
         "total_tokens": src.get("total_tokens", 0),
     }
+
+
+# Provider batch statuses that mean "still working".
+_PENDING_STATUSES = {"validating", "in_progress", "finalizing"}
+# Provider batch statuses that mean "terminally dead".
+_FAILED_STATUSES = {"failed", "expired", "cancelled", "canceling", "cancelling"}
+
+
+def poll_batch(handle: BatchHandle) -> PollResult:
+    """Poll one batch job once and classify the outcome.
+
+    Returns a PollResult with status pending | completed | failed | transient_error.
+    Transient errors (429/timeout/5xx) never become `failed` — the Job keeps
+    polling (spec §8.1).
+    """
+    provider = handle.provider
+    try:
+        batch = litellm.retrieve_batch(
+            batch_id=handle.batch_job_id, custom_llm_provider=provider)
+    except Exception as exc:
+        if _is_transient(exc):
+            return PollResult(status="transient_error", error_message=str(exc))
+        raise
+
+    status = getattr(batch, "status", None)
+    if status in _PENDING_STATUSES:
+        return PollResult(status="pending")
+    if status in _FAILED_STATUSES:
+        return PollResult(
+            status="failed",
+            error_message=f"batch {handle.batch_job_id} reported status={status}",
+        )
+    if status != "completed":
+        return PollResult(
+            status="failed",
+            error_message=f"batch {handle.batch_job_id} unknown status={status}",
+        )
+
+    output_file_id = getattr(batch, "output_file_id", None)
+    try:
+        content = litellm.file_content(
+            file_id=output_file_id, custom_llm_provider=provider)
+    except Exception as exc:
+        if _is_transient(exc):
+            return PollResult(status="transient_error", error_message=str(exc))
+        raise
+
+    raw = content.text if hasattr(content, "text") else content.content.decode()
+    results_by_id: dict[str, str] = {}
+    total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        obj = json.loads(line)
+        custom_id = obj.get("custom_id")
+        if obj.get("error"):
+            return PollResult(
+                status="failed", output_file_id=output_file_id,
+                error_message=f"{custom_id}: {obj['error']}")
+        response = obj.get("response", {})
+        status_code = response.get("status_code", 200)
+        if status_code != 200:
+            return PollResult(
+                status="failed", output_file_id=output_file_id,
+                error_message=f"{custom_id}: request failed with status {status_code}")
+        body = response["body"]
+        results_by_id[custom_id] = body["choices"][0]["message"]["content"]
+        usage = _usage_dict(body.get("usage"))
+        total["prompt_tokens"] += usage["prompt_tokens"]
+        total["completion_tokens"] += usage["completion_tokens"]
+        total["total_tokens"] += usage["total_tokens"]
+
+    texts = [results_by_id[f"req-{i}"] for i in range(len(results_by_id))]
+    cost = _cost_dict(handle.model, total, batch=True)
+    return PollResult(
+        status="completed", texts=texts, usage=total, cost=cost,
+        output_file_id=output_file_id)

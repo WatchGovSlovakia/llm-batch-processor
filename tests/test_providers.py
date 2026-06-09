@@ -150,3 +150,84 @@ def test_complete_wraps_transient_errors(litellm_mock):
     litellm_mock.completion = boom2
     with pytest.raises(providers.TransientProviderError):
         providers.complete("gpt-4o", [{"role": "user", "content": "q"}])
+
+
+from tests.conftest import batch_output_jsonl
+
+
+def _handle(model="gpt-4o"):
+    return BatchHandle(provider=providers.provider_of(model), model=model,
+                       batch_job_id="batches/job-1", input_file_id="files/in-1")
+
+
+def test_poll_batch_pending(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="in_progress")
+    result = providers.poll_batch(_handle())
+    assert result.status == "pending"
+
+
+def test_poll_batch_completed_single(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(
+        status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: batch_output_jsonl(["extracted text"])
+    litellm_mock.cost_per_token = lambda **k: (0.01, 0.02)
+
+    result = providers.poll_batch(_handle())
+    assert result.status == "completed"
+    assert result.texts == ["extracted text"]
+    assert result.output_file_id == "files/out-1"
+    # batch discount: charged is half of interactive
+    assert result.cost["charged_usd"] == pytest.approx(result.cost["interactive_usd"] * 0.5)
+    assert result.cost["saved_usd"] == pytest.approx(result.cost["interactive_usd"] * 0.5)
+
+
+def test_poll_batch_completed_bundle_ordered_by_custom_id(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(
+        status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: batch_output_jsonl(["page one", "page two", "page three"])
+    litellm_mock.cost_per_token = lambda **k: (0.0, 0.0)
+    result = providers.poll_batch(_handle())
+    assert result.texts == ["page one", "page two", "page three"]
+    assert result.usage["total_tokens"] == 45  # 3 requests * 15
+
+
+def test_poll_batch_provider_failed_is_terminal(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="failed")
+    result = providers.poll_batch(_handle())
+    assert result.status == "failed"
+
+
+def test_poll_batch_expired_is_terminal(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="expired")
+    assert providers.poll_batch(_handle()).status == "failed"
+
+
+def test_poll_batch_per_request_error_is_terminal(litellm_mock):
+    from tests.conftest import make_obj as mk
+    bad_body = '{"custom_id": "req-0", "response": {"status_code": 400, "body": {}}}\n'
+    litellm_mock.retrieve_batch = lambda **k: mk(status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: mk(text=bad_body, content=bad_body.encode())
+    result = providers.poll_batch(_handle())
+    assert result.status == "failed"
+    assert "req-0" in result.error_message
+
+
+def test_poll_batch_transient_on_retrieve(litellm_mock):
+    def boom(**k):
+        e = RuntimeError("503 unavailable")
+        e.status_code = 503
+        raise e
+    litellm_mock.retrieve_batch = boom
+    result = providers.poll_batch(_handle())
+    assert result.status == "transient_error"
+
+
+def test_poll_batch_transient_on_file_content(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="completed", output_file_id="files/out-1")
+    def boom(**k):
+        e = RuntimeError("429")
+        e.status_code = 429
+        raise e
+    litellm_mock.file_content = boom
+    result = providers.poll_batch(_handle())
+    assert result.status == "transient_error"
