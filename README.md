@@ -97,3 +97,100 @@ default (`cleanup_provider_files=True`): OpenAI file objects (quota) and Vertex
 GCS objects (billing). Gemini-API and Anthropic auto-expire (no-op).
 
 See `examples/government_contracts/` for a full GitHub Actions deployment.
+
+## Vertex AI setup
+
+Vertex AI is the recommended provider for trying out batch mode: it's one of
+the few providers litellm can both submit **and** cancel batch jobs for
+(alongside OpenAI/Azure), which makes it the best target for exercising
+`fallback_strategy="speculative"`.
+
+Prerequisite: the GCP project must already have billing enabled
+(`gcloud billing projects describe "$VERTEXAI_PROJECT"` to check;
+`gcloud billing projects link` to fix).
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=~/llm-batch-test-key.json
+export VERTEXAI_PROJECT=playgrounds-1234567890123
+export VERTEXAI_LOCATION=us-central1
+export GCS_BUCKET_NAME=llm-batch-test-bucket   # required: litellm stages batch I/O here
+VERTEXAI_USER=llm-batch-tester
+
+gcloud auth login
+gcloud config set project "$VERTEXAI_PROJECT"
+gcloud services enable aiplatform.googleapis.com storage.googleapis.com
+
+gcloud iam service-accounts create "$VERTEXAI_USER" \
+    --display-name="llm-batch testing"
+
+gcloud projects add-iam-policy-binding "$VERTEXAI_PROJECT" \
+  --member="serviceAccount:$VERTEXAI_USER@$VERTEXAI_PROJECT.iam.gserviceaccount.com" \
+  --role="roles/aiplatform.user"
+
+gcloud projects add-iam-policy-binding "$VERTEXAI_PROJECT" \
+  --member="serviceAccount:$VERTEXAI_USER@$VERTEXAI_PROJECT.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+
+gcloud iam service-accounts keys create "$GOOGLE_APPLICATION_CREDENTIALS" \
+  --iam-account="$VERTEXAI_USER@$VERTEXAI_PROJECT.iam.gserviceaccount.com"
+
+gcloud storage buckets create "gs://$GCS_BUCKET_NAME" \
+  --location="$VERTEXAI_LOCATION" --project="$VERTEXAI_PROJECT"
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install git+https://github.com/michalfapso/llm-batch-processor.git
+pip install google-cloud-aiplatform google-cloud-storage
+```
+
+The downloaded service account key is a live credential — keep it out of git
+(`.gitignore` it, never commit it).
+
+### Known litellm issue: `Message` not fully defined
+
+As of `litellm==1.97.0` (the latest release at time of writing), `litellm/types/utils.py`
+is missing an import of `ChatCompletionReasoningSummaryTextBlock`, which breaks
+`Message` under current `pydantic` releases with:
+
+```
+pydantic.errors.PydanticUserError: `Message` is not fully defined; you should
+define all referenced types, then call `Message.model_rebuild()`.
+```
+
+This is unrelated to your GCP/pydantic/openai package versions — it reproduces
+identically across pydantic 2.10–2.13. A fix is already up as
+[litellm PR #36387](https://github.com/BerriAI/litellm/pull/36387), not yet
+merged/released. Until it ships, work around it by running this once at the
+top of any script that imports `llm_batch` or `litellm`:
+
+```python
+import litellm.types.utils as _litellm_utils
+from litellm.types.llms.openai import ChatCompletionReasoningSummaryTextBlock as _RSTB
+_litellm_utils.ChatCompletionReasoningSummaryTextBlock = _RSTB
+_litellm_utils.Message.model_rebuild(force=True)
+```
+
+Remove this workaround once you're on a litellm release that includes the fix.
+
+### Smoke test
+
+```python
+from llm_batch import Pipeline
+
+pipeline = Pipeline(state_dir="./state/smoke_test/", mode="batch")
+job = pipeline.job("smoke", messages=[{"role": "user", "content": "Say hi in one word."}],
+                    model="vertex_ai/gemini-2.5-flash")
+result = job.execute()
+print(result)
+if result is None:
+    print("Batch submitted, not yet complete — re-run this script to poll.")
+    raise SystemExit(1)   # don't call pipeline.finish() until the job is actually done
+
+print("Done. Cost summary:", pipeline.cost_summary())
+pipeline.finish()
+```
+
+Re-run the script to poll; Vertex batch jobs target a 24h SLO but small jobs
+often finish in minutes. `charged_usd` in the cost summary should come out to
+roughly half of `interactive_usd`, confirming the batch discount applied.
