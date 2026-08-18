@@ -117,15 +117,24 @@ def _is_transient(exc: Exception) -> bool:
 TransientProviderError = TransientProviderError
 
 
+def _bare_model(model: str) -> str:
+    """Strip the litellm '<provider>/' routing prefix, e.g. 'vertex_ai/gemini-2.5-flash'
+    -> 'gemini-2.5-flash'. Providers' own batch APIs expect their native model name, not
+    litellm's routing string (Vertex derives the model resource path from this field)."""
+    prefix = f"{provider_of(model)}/"
+    return model[len(prefix):] if model.startswith(prefix) else model
+
+
 def _build_jsonl(model: str, requests: list, **kw) -> str:
     """One JSON line per request; custom_id req-0..req-N; kwargs merged into body."""
+    bare_model = _bare_model(model)
     lines = []
     for i, messages in enumerate(requests):
         lines.append(json.dumps({
             "custom_id": f"req-{i}",
             "method": "POST",
             "url": "/v1/chat/completions",
-            "body": {"model": model, "messages": messages, **kw},
+            "body": {"model": bare_model, "messages": messages, **kw},
         }))
     return "\n".join(lines) + "\n"
 
