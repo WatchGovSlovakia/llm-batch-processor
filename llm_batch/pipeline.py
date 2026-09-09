@@ -85,6 +85,17 @@ class Pipeline:
                 total[k] += cost.get(k, 0.0)
         return total
 
+    def usage_summary(self) -> dict:
+        total = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'requests': 0}
+        for handle in self._backend.iter_jobs():
+            usage = handle.get('usage') or {}
+            if not usage:
+                continue
+            for k in ('prompt_tokens', 'completion_tokens', 'total_tokens'):
+                total[k] += usage.get(k, 0)
+            total['requests'] += 1
+        return total
+
     def finish(self) -> None:
         """Delete this pipeline's local state files."""
         for handle in list(self._backend.iter_jobs()):

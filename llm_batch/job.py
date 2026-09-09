@@ -148,6 +148,10 @@ class Job:
             return None
         return self._state.get("response")
 
+    @property
+    def usage(self) -> dict:
+        return dict(self._state.get('usage') or _ZERO_USAGE)
+
     def snapshot(self) -> dict:
         return dict(self._state)
 

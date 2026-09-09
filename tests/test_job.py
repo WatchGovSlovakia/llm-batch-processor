@@ -178,3 +178,31 @@ def test_persist_happens_before_cleanup(tmp_path, fake_providers, monkeypatch):
     handle.save = traced_save
     job.execute()
     assert order.index("save") < order.index("cleanup")
+
+
+def test_usage_property_returns_zero_dict_when_not_completed(tmp_path, fake_providers):
+    job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="batch")
+    assert job.usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+def test_usage_property_returns_stored_usage_when_completed(tmp_path, fake_providers, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+        status="completed", texts=["the text"],
+        usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+        cost={"charged_usd": 0.01, "interactive_usd": 0.02, "saved_usd": 0.01},
+        output_file_id="files/out-1"))
+    job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="batch")
+    job.execute()                       # submit -> SENT
+    job.execute()                       # poll -> COMPLETED
+    assert job.usage == {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+
+
+def test_usage_property_returns_zero_dict_when_no_usage_key_in_state(tmp_path, fake_providers):
+    # Build a job and directly manipulate its state to have no 'usage' key
+    handle = _handle(tmp_path)
+    job = Job(handle, "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="batch")
+    job._state = {"state": "completed", "response": "test"}
+    assert job.usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
