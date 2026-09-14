@@ -16,3 +16,6 @@ venv/
 
 # Env
 .env
+
+# Git worktrees
+.worktrees/
