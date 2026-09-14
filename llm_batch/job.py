@@ -153,6 +153,10 @@ class Job:
         return dict(self._state.get('usage') or _ZERO_USAGE)
 
     @property
+    def cost(self) -> dict:
+        return dict(self._state.get('cost') or _ZERO_COST)
+
+    @property
     def finish_reason(self) -> str | None:
         return self._state.get('finish_reason')
 
