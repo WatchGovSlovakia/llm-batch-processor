@@ -245,12 +245,14 @@ def test_state_b_cancelled_reissues_interactively(tmp_path, monkeypatch):
     monkeypatch.setattr(
         job_module.providers, "complete",
         lambda model, messages, **kw: CompletionResult(
-            text="interactive-now", usage={}, cost={"charged_usd": 0.02, "interactive_usd": 0.02, "saved_usd": 0.0}))
+            text="interactive-now", usage={}, cost={"charged_usd": 0.02, "interactive_usd": 0.02, "saved_usd": 0.0},
+            finish_reason="stop"))
     handle = _seed_cancel_requested(tmp_path, cancel_requested_at=_now().isoformat())
     job = Job(handle)
     assert job.execute() == "interactive-now"
     assert job.state == Job.COMPLETED
     assert job.snapshot()["actual_mode"] == "interactive"
+    assert job.finish_reason == "stop"
 
 
 def test_state_b_still_queued_keeps_waiting(tmp_path, monkeypatch):

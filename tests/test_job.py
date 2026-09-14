@@ -10,15 +10,18 @@ from llm_batch.storage.file import FileStorage
 @pytest.fixture
 def fake_providers(monkeypatch):
     """Stub the provider layer for Job tests; configurable per test."""
-    calls = {"submit": 0, "poll": 0, "complete": 0, "cleanup": []}
+    calls = {"submit": 0, "poll": 0, "complete": 0, "cleanup": [],
+             "submit_kwargs": None, "complete_kwargs": None}
 
     def submit_batch(model, requests, **kw):
         calls["submit"] += 1
+        calls["submit_kwargs"] = kw
         return BatchHandle(provider="openai", model=model,
                            batch_job_id="batches/job-1", input_file_id="files/in-1")
 
     def complete(model, messages, **kw):
         calls["complete"] += 1
+        calls["complete_kwargs"] = kw
         return CompletionResult(text="interactive answer",
                                 usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                                 cost={"charged_usd": 0.02, "interactive_usd": 0.02, "saved_usd": 0.0})
@@ -206,3 +209,109 @@ def test_usage_property_returns_zero_dict_when_no_usage_key_in_state(tmp_path, f
               model="gpt-4o", mode="batch")
     job._state = {"state": "completed", "response": "test"}
     assert job.usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+def test_finish_reason_property_none_before_completion(tmp_path, fake_providers):
+    job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="batch")
+    assert job.finish_reason is None
+
+
+def test_finish_reason_property_returns_stored_value_after_batch_completion(
+    tmp_path, fake_providers, monkeypatch
+):
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+        status="completed", texts=["the text"],
+        usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+        cost={"charged_usd": 0.01, "interactive_usd": 0.02, "saved_usd": 0.01},
+        output_file_id="files/out-1", finish_reason="length"))
+    job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="batch")
+    job.execute()                       # submit -> SENT
+    job.execute()                       # poll -> COMPLETED
+    assert job.finish_reason == "length"
+
+
+def test_finish_reason_property_none_when_no_key_in_state(tmp_path, fake_providers):
+    handle = _handle(tmp_path)
+    job = Job(handle, "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="batch")
+    job._state = {"state": "completed", "response": "test"}
+    assert job.finish_reason is None
+
+
+def test_finish_reason_set_from_interactive_completion(tmp_path, fake_providers, monkeypatch):
+    def complete(model, messages, **kw):
+        return CompletionResult(text="interactive answer",
+                                 usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                                 cost={"charged_usd": 0.02, "interactive_usd": 0.02, "saved_usd": 0.0},
+                                 finish_reason="stop")
+    monkeypatch.setattr(job_module.providers, "complete", complete)
+    job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="interactive")
+    job.execute()
+    assert job.finish_reason == "stop"
+
+
+def test_finish_reason_none_for_bundle_response(tmp_path, fake_providers, monkeypatch):
+    def complete(model, messages, **kw):
+        return CompletionResult(text="interactive answer",
+                                 usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                                 cost={"charged_usd": 0.02, "interactive_usd": 0.02, "saved_usd": 0.0},
+                                 finish_reason="stop")
+    monkeypatch.setattr(job_module.providers, "complete", complete)
+    job = Job(_handle(tmp_path), "x",
+              requests=[[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}]],
+              model="gpt-4o", mode="interactive")
+    job.execute()
+    assert job.finish_reason is None  # bundle: scalar not populated
+
+
+def test_finish_reason_none_for_one_request_bundle_via_batch_completion(
+    tmp_path, fake_providers, monkeypatch
+):
+    # A bundle of exactly one request (requests=[[msg]]) completing via the batch
+    # poll path. providers.poll_batch's count-based rule (n_requests == 1) would
+    # populate a scalar finish_reason here, mimicking the provider layer -- but
+    # this job is still a bundle (_is_bundle is True), so finish_reason must stay
+    # None for consistency with the interactive completion paths.
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+        status="completed", texts=["the text"],
+        usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+        cost={"charged_usd": 0.01, "interactive_usd": 0.02, "saved_usd": 0.01},
+        output_file_id="files/out-1", finish_reason="length"))
+    job = Job(_handle(tmp_path), "x",
+              requests=[[{"role": "user", "content": "a"}]],
+              model="gpt-4o", mode="batch")
+    job.execute()                       # submit -> SENT
+    job.execute()                       # poll -> COMPLETED
+    assert job.finish_reason is None
+
+
+def test_max_tokens_and_thinking_kwargs_reach_batch_submit(tmp_path, fake_providers):
+    job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="batch",
+              max_tokens=4000, thinking={"type": "disabled"})
+    job.execute()
+    assert fake_providers["submit_kwargs"]["max_tokens"] == 4000
+    assert fake_providers["submit_kwargs"]["thinking"] == {"type": "disabled"}
+
+
+def test_max_tokens_and_thinking_kwargs_reach_interactive_complete(tmp_path, fake_providers):
+    job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="interactive",
+              max_tokens=4000, thinking={"type": "disabled"})
+    job.execute()
+    assert fake_providers["complete_kwargs"]["max_tokens"] == 4000
+    assert fake_providers["complete_kwargs"]["thinking"] == {"type": "disabled"}
+
+
+def test_pipeline_job_forwards_max_tokens_and_thinking(tmp_path, fake_providers):
+    from llm_batch import Pipeline
+
+    pipeline = Pipeline(str(tmp_path), mode="batch")
+    job = pipeline.job("x", messages=[{"role": "user", "content": "hi"}], model="gpt-4o",
+                       max_tokens=4000, thinking={"type": "disabled"})
+    job.execute()
+    assert fake_providers["submit_kwargs"]["max_tokens"] == 4000
+    assert fake_providers["submit_kwargs"]["thinking"] == {"type": "disabled"}

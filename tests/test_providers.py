@@ -359,3 +359,58 @@ def test_cancel_wraps_transient_errors(litellm_mock):
     handle = providers.BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1")
     with pytest.raises(providers.TransientProviderError):
         providers.cancel(handle)
+
+
+def test_dataclasses_finish_reason_defaults_to_none():
+    pr = PollResult(status="pending")
+    assert pr.finish_reason is None
+    cr = CompletionResult(text="hi", usage={}, cost={})
+    assert cr.finish_reason is None
+
+
+def test_complete_returns_finish_reason(litellm_mock):
+    litellm_mock.completion = lambda **k: completion_response(
+        "the answer", finish_reason="stop")
+    litellm_mock.cost_per_token = lambda **k: (0.0, 0.0)
+    result = providers.complete("gpt-4o", [{"role": "user", "content": "q"}])
+    assert result.finish_reason == "stop"
+
+
+def test_complete_finish_reason_none_when_absent(litellm_mock):
+    litellm_mock.completion = lambda **k: completion_response("the answer")
+    litellm_mock.cost_per_token = lambda **k: (0.0, 0.0)
+    result = providers.complete("gpt-4o", [{"role": "user", "content": "q"}])
+    assert result.finish_reason is None
+
+
+def test_poll_batch_completed_single_request_returns_finish_reason(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(
+        status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: batch_output_jsonl(
+        ["the text"], finish_reasons=["length"])
+    handle = BatchHandle(provider="openai", model="gpt-4o",
+                          batch_job_id="b1", n_requests=1)
+    result = providers.poll_batch(handle)
+    assert result.status == "completed"
+    assert result.finish_reason == "length"
+
+
+def test_poll_batch_completed_bundle_returns_none_finish_reason(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(
+        status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: batch_output_jsonl(
+        ["p1", "p2"], finish_reasons=["stop", "length"])
+    handle = BatchHandle(provider="openai", model="gpt-4o",
+                          batch_job_id="b1", n_requests=2)
+    result = providers.poll_batch(handle)
+    assert result.finish_reason is None  # bundle: scalar not populated
+
+
+def test_poll_batch_completed_missing_finish_reason_key_is_none(litellm_mock):
+    litellm_mock.retrieve_batch = lambda **k: make_obj(
+        status="completed", output_file_id="files/out-1")
+    litellm_mock.file_content = lambda **k: batch_output_jsonl(["the text"])
+    handle = BatchHandle(provider="openai", model="gpt-4o",
+                          batch_job_id="b1", n_requests=1)
+    result = providers.poll_batch(handle)
+    assert result.finish_reason is None

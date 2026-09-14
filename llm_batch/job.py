@@ -57,8 +57,8 @@ def _default_cancel_resolution_timeout(provider: str) -> float:
 _PERSISTED_FIELDS = (
     "key", "state", "mode", "model", "n_requests", "bundle", "batch_job_id",
     "input_file_id", "output_file_id", "submitted_at", "completed_at", "deadline",
-    "actual_mode", "response", "usage", "cost", "error_message", "poll_attempts",
-    "rerun_cmd", "cleanup_provider_files",
+    "actual_mode", "response", "usage", "cost", "finish_reason", "error_message",
+    "poll_attempts", "rerun_cmd", "cleanup_provider_files",
     "fallback_strategy", "payload", "litellm_kwargs", "cancel_requested_at",
 )
 
@@ -151,6 +151,10 @@ class Job:
     @property
     def usage(self) -> dict:
         return dict(self._state.get('usage') or _ZERO_USAGE)
+
+    @property
+    def finish_reason(self) -> str | None:
+        return self._state.get('finish_reason')
 
     def snapshot(self) -> dict:
         return dict(self._state)
@@ -273,6 +277,7 @@ class Job:
             "response": None,
             "usage": dict(_ZERO_USAGE),
             "cost": dict(_ZERO_COST),
+            "finish_reason": None,
             "error_message": None,
             "poll_attempts": 0,
             "fallback_strategy": "conservative",
@@ -307,12 +312,14 @@ class Job:
         texts = []
         usage = dict(_ZERO_USAGE)
         cost = dict(_ZERO_COST)
+        last_finish_reason = None
         try:
             for messages in self._payload:
                 cr = providers.complete(self._model, messages, **self._kw)
                 texts.append(cr.text)
                 _accumulate(usage, cr.usage)
                 _accumulate_cost(cost, cr.cost)
+                last_finish_reason = cr.finish_reason
         except providers.TransientProviderError:
             return None  # leave state NOT_SENT; retried next run
 
@@ -320,7 +327,8 @@ class Job:
         state = self._base_state()
         state.update(state=self.COMPLETED, actual_mode="interactive",
                      completed_at=_now_iso(), response=response,
-                     usage=usage, cost=cost)
+                     usage=usage, cost=cost,
+                     finish_reason=None if self._is_bundle else last_finish_reason)
         self._state = state
         self._save()
         return response
@@ -383,6 +391,7 @@ class Job:
         self._state.update(
             state=self.COMPLETED, response=response, completed_at=_now_iso(),
             usage=result.usage, cost=result.cost,
+            finish_reason=None if self._is_bundle else result.finish_reason,
             output_file_id=result.output_file_id, error_message=None)
         self._save()  # persist BEFORE provider-side cleanup (spec §7.1)
         if self._cleanup:
@@ -471,12 +480,14 @@ class Job:
         texts = []
         usage = dict(_ZERO_USAGE)
         cost = dict(_ZERO_COST)
+        last_finish_reason = None
         try:
             for messages in self._payload:
                 cr = providers.complete(self._model, messages, **self._kw)
                 texts.append(cr.text)
                 _accumulate(usage, cr.usage)
                 _accumulate_cost(cost, cr.cost)
+                last_finish_reason = cr.finish_reason
         except providers.TransientProviderError:
             self._save()  # stay CANCEL_REQUESTED; retry interactive next poll
             return None
@@ -485,6 +496,7 @@ class Job:
         self._state.update(
             state=self.COMPLETED, actual_mode="interactive",
             completed_at=_now_iso(), response=response, usage=usage, cost=cost,
+            finish_reason=None if self._is_bundle else last_finish_reason,
             error_message=None)
         self._save()
         if self._cleanup:
