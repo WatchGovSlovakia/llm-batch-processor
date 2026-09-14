@@ -267,6 +267,27 @@ def test_finish_reason_none_for_bundle_response(tmp_path, fake_providers, monkey
     assert job.finish_reason is None  # bundle: scalar not populated
 
 
+def test_finish_reason_none_for_one_request_bundle_via_batch_completion(
+    tmp_path, fake_providers, monkeypatch
+):
+    # A bundle of exactly one request (requests=[[msg]]) completing via the batch
+    # poll path. providers.poll_batch's count-based rule (n_requests == 1) would
+    # populate a scalar finish_reason here, mimicking the provider layer -- but
+    # this job is still a bundle (_is_bundle is True), so finish_reason must stay
+    # None for consistency with the interactive completion paths.
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+        status="completed", texts=["the text"],
+        usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+        cost={"charged_usd": 0.01, "interactive_usd": 0.02, "saved_usd": 0.01},
+        output_file_id="files/out-1", finish_reason="length"))
+    job = Job(_handle(tmp_path), "x",
+              requests=[[{"role": "user", "content": "a"}]],
+              model="gpt-4o", mode="batch")
+    job.execute()                       # submit -> SENT
+    job.execute()                       # poll -> COMPLETED
+    assert job.finish_reason is None
+
+
 def test_max_tokens_and_thinking_kwargs_reach_batch_submit(tmp_path, fake_providers):
     job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
               model="gpt-4o", mode="batch",

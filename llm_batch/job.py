@@ -390,7 +390,8 @@ class Job:
         response = result.texts if self._is_bundle else result.texts[0]
         self._state.update(
             state=self.COMPLETED, response=response, completed_at=_now_iso(),
-            usage=result.usage, cost=result.cost, finish_reason=result.finish_reason,
+            usage=result.usage, cost=result.cost,
+            finish_reason=None if self._is_bundle else result.finish_reason,
             output_file_id=result.output_file_id, error_message=None)
         self._save()  # persist BEFORE provider-side cleanup (spec §7.1)
         if self._cleanup:

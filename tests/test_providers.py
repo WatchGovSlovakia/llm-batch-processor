@@ -384,8 +384,6 @@ def test_complete_finish_reason_none_when_absent(litellm_mock):
 
 
 def test_poll_batch_completed_single_request_returns_finish_reason(litellm_mock):
-    from tests.conftest import batch_output_jsonl
-
     litellm_mock.retrieve_batch = lambda **k: make_obj(
         status="completed", output_file_id="files/out-1")
     litellm_mock.file_content = lambda **k: batch_output_jsonl(
@@ -398,8 +396,6 @@ def test_poll_batch_completed_single_request_returns_finish_reason(litellm_mock)
 
 
 def test_poll_batch_completed_bundle_returns_none_finish_reason(litellm_mock):
-    from tests.conftest import batch_output_jsonl
-
     litellm_mock.retrieve_batch = lambda **k: make_obj(
         status="completed", output_file_id="files/out-1")
     litellm_mock.file_content = lambda **k: batch_output_jsonl(
@@ -411,8 +407,6 @@ def test_poll_batch_completed_bundle_returns_none_finish_reason(litellm_mock):
 
 
 def test_poll_batch_completed_missing_finish_reason_key_is_none(litellm_mock):
-    from tests.conftest import batch_output_jsonl
-
     litellm_mock.retrieve_batch = lambda **k: make_obj(
         status="completed", output_file_id="files/out-1")
     litellm_mock.file_content = lambda **k: batch_output_jsonl(["the text"])
