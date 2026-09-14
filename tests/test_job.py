@@ -10,15 +10,18 @@ from llm_batch.storage.file import FileStorage
 @pytest.fixture
 def fake_providers(monkeypatch):
     """Stub the provider layer for Job tests; configurable per test."""
-    calls = {"submit": 0, "poll": 0, "complete": 0, "cleanup": []}
+    calls = {"submit": 0, "poll": 0, "complete": 0, "cleanup": [],
+             "submit_kwargs": None, "complete_kwargs": None}
 
     def submit_batch(model, requests, **kw):
         calls["submit"] += 1
+        calls["submit_kwargs"] = kw
         return BatchHandle(provider="openai", model=model,
                            batch_job_id="batches/job-1", input_file_id="files/in-1")
 
     def complete(model, messages, **kw):
         calls["complete"] += 1
+        calls["complete_kwargs"] = kw
         return CompletionResult(text="interactive answer",
                                 usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                                 cost={"charged_usd": 0.02, "interactive_usd": 0.02, "saved_usd": 0.0})
@@ -262,3 +265,32 @@ def test_finish_reason_none_for_bundle_response(tmp_path, fake_providers, monkey
               model="gpt-4o", mode="interactive")
     job.execute()
     assert job.finish_reason is None  # bundle: scalar not populated
+
+
+def test_max_tokens_and_thinking_kwargs_reach_batch_submit(tmp_path, fake_providers):
+    job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="batch",
+              max_tokens=4000, thinking={"type": "disabled"})
+    job.execute()
+    assert fake_providers["submit_kwargs"]["max_tokens"] == 4000
+    assert fake_providers["submit_kwargs"]["thinking"] == {"type": "disabled"}
+
+
+def test_max_tokens_and_thinking_kwargs_reach_interactive_complete(tmp_path, fake_providers):
+    job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="interactive",
+              max_tokens=4000, thinking={"type": "disabled"})
+    job.execute()
+    assert fake_providers["complete_kwargs"]["max_tokens"] == 4000
+    assert fake_providers["complete_kwargs"]["thinking"] == {"type": "disabled"}
+
+
+def test_pipeline_job_forwards_max_tokens_and_thinking(tmp_path, fake_providers):
+    from llm_batch import Pipeline
+
+    pipeline = Pipeline(str(tmp_path), mode="batch")
+    job = pipeline.job("x", messages=[{"role": "user", "content": "hi"}], model="gpt-4o",
+                       max_tokens=4000, thinking={"type": "disabled"})
+    job.execute()
+    assert fake_providers["submit_kwargs"]["max_tokens"] == 4000
+    assert fake_providers["submit_kwargs"]["thinking"] == {"type": "disabled"}
