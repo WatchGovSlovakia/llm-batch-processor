@@ -359,3 +359,10 @@ def test_cancel_wraps_transient_errors(litellm_mock):
     handle = providers.BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1")
     with pytest.raises(providers.TransientProviderError):
         providers.cancel(handle)
+
+
+def test_dataclasses_finish_reason_defaults_to_none():
+    pr = PollResult(status="pending")
+    assert pr.finish_reason is None
+    cr = CompletionResult(text="hi", usage={}, cost={})
+    assert cr.finish_reason is None

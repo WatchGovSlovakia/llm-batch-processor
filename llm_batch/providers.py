@@ -58,6 +58,9 @@ class PollResult:
     cost: dict | None = None
     output_file_id: str | None = None
     error_message: str | None = None
+    # Scalar: populated for a single-request batch job; None for a bundle
+    # response until/unless a future consumer needs per-item values.
+    finish_reason: str | None = None
 
 
 @dataclass
@@ -67,6 +70,7 @@ class CompletionResult:
     text: str
     usage: dict
     cost: dict
+    finish_reason: str | None = None
 
 
 def provider_of(model: str) -> str:

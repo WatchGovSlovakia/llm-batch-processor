@@ -37,20 +37,26 @@ def make_obj(**attrs):
     return types.SimpleNamespace(**attrs)
 
 
-def batch_output_jsonl(texts, usage=None):
+def batch_output_jsonl(texts, usage=None, finish_reasons=None):
     """Build the raw JSONL body that litellm.file_content returns for a completed batch.
 
-    `texts` is a list aligned to custom_id req-0..req-N.
+    `texts` is a list aligned to custom_id req-0..req-N. `finish_reasons`, if
+    given, is a list aligned to `texts`; omitted entries mean no
+    "finish_reason" key in that line's body (production code must treat a
+    missing key the same as an explicit None).
     """
     usage = usage or {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     lines = []
     for i, text in enumerate(texts):
+        choice: dict = {"message": {"content": text}}
+        if finish_reasons is not None and finish_reasons[i] is not None:
+            choice["finish_reason"] = finish_reasons[i]
         lines.append(json.dumps({
             "custom_id": f"req-{i}",
             "response": {
                 "status_code": 200,
                 "body": {
-                    "choices": [{"message": {"content": text}}],
+                    "choices": [choice],
                     "usage": usage,
                 },
             },
@@ -59,9 +65,9 @@ def batch_output_jsonl(texts, usage=None):
     return make_obj(text=body, content=body.encode())
 
 
-def completion_response(text, usage=None):
+def completion_response(text, usage=None, finish_reason=None):
     """Build a stand-in for a litellm.completion(...) response."""
     usage = usage or {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     message = make_obj(content=text)
-    choice = make_obj(message=message)
+    choice = make_obj(message=message, finish_reason=finish_reason)
     return make_obj(choices=[choice], usage=usage)
