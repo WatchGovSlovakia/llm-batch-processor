@@ -205,10 +205,12 @@ def complete(model: str, messages: list, **kw) -> CompletionResult:
         if _is_transient(exc):
             raise TransientProviderError(str(exc)) from exc
         raise
-    text = response.choices[0].message.content
+    choice = response.choices[0]
+    text = choice.message.content
     usage = _usage_dict(response.usage)
     cost = _cost_dict(model, usage, batch=False)
-    return CompletionResult(text=text, usage=usage, cost=cost)
+    finish_reason = getattr(choice, "finish_reason", None)
+    return CompletionResult(text=text, usage=usage, cost=cost, finish_reason=finish_reason)
 
 
 def _usage_dict(usage) -> dict:
@@ -286,6 +288,7 @@ def poll_batch(handle: BatchHandle) -> PollResult:
 
     raw = content.text if hasattr(content, "text") else content.content.decode()
     results_by_id: dict[str, str] = {}
+    finish_reasons_by_id: dict[str, str | None] = {}
     total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     for line in raw.splitlines():
         if not line.strip():
@@ -304,6 +307,7 @@ def poll_batch(handle: BatchHandle) -> PollResult:
                 error_message=f"{custom_id}: request failed with status {status_code}")
         body = response["body"]
         results_by_id[custom_id] = body["choices"][0]["message"]["content"]
+        finish_reasons_by_id[custom_id] = body["choices"][0].get("finish_reason")
         usage = _usage_dict(body.get("usage"))
         total["prompt_tokens"] += usage["prompt_tokens"]
         total["completion_tokens"] += usage["completion_tokens"]
@@ -322,9 +326,13 @@ def poll_batch(handle: BatchHandle) -> PollResult:
                                f"({len(results_by_id)}/{expected} returned)"))
         texts.append(results_by_id[custom_id])
     cost = _cost_dict(handle.model, total, batch=True)
+    # Scalar finish_reason only makes sense for a single-request batch
+    # (the only usage shape any known caller has today); a multi-request/
+    # bundle response leaves it None (spec §2 — PollResult.finish_reason).
+    finish_reason = finish_reasons_by_id.get("req-0") if len(texts) == 1 else None
     return PollResult(
         status="completed", texts=texts, usage=total, cost=cost,
-        output_file_id=output_file_id)
+        output_file_id=output_file_id, finish_reason=finish_reason)
 
 
 def cleanup(handle: BatchHandle) -> None:
