@@ -77,17 +77,30 @@ class Pipeline:
             cancel_resolution_timeout_hours=self._cancel_resolution_timeout_h,
             **litellm_kwargs)
 
-    def cost_summary(self) -> dict:
+    def cost_summary(self, job_keys=None) -> dict:
+        """Cost triple across this pipeline's jobs.
+
+        job_keys restricts the total to just those keys (e.g. one
+        reprocessing pass's own jobs) instead of every job ever persisted
+        to this state dir.
+        """
+        wanted = set(job_keys) if job_keys is not None else None
         total = {"charged_usd": 0.0, "interactive_usd": 0.0, "saved_usd": 0.0}
         for handle in self._backend.iter_jobs():
+            if wanted is not None and handle.get("key") not in wanted:
+                continue
             cost = handle.get("cost") or {}
             for k in total:
                 total[k] += cost.get(k, 0.0)
         return total
 
-    def usage_summary(self) -> dict:
+    def usage_summary(self, job_keys=None) -> dict:
+        """Usage totals across this pipeline's jobs, optionally filtered to job_keys."""
+        wanted = set(job_keys) if job_keys is not None else None
         total = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'requests': 0}
         for handle in self._backend.iter_jobs():
+            if wanted is not None and handle.get("key") not in wanted:
+                continue
             usage = handle.get('usage') or {}
             if not usage:
                 continue

@@ -74,6 +74,26 @@ def test_usage_summary_aggregates_across_jobs(tmp_path, fake_providers):
     assert summary["requests"] == 2
 
 
+def test_cost_summary_filters_by_job_keys(tmp_path, fake_providers):
+    p = Pipeline(state_dir=str(tmp_path), mode="interactive")
+    p.job("a", messages=[{"role": "user", "content": "x"}], model="gpt-4o").execute()
+    p.job("b", messages=[{"role": "user", "content": "y"}], model="gpt-4o").execute()
+    summary = p.cost_summary(job_keys=["b"])
+    assert summary["charged_usd"] == pytest.approx(0.05)
+    assert summary["interactive_usd"] == pytest.approx(0.05)
+
+
+def test_usage_summary_filters_by_job_keys(tmp_path, fake_providers):
+    p = Pipeline(state_dir=str(tmp_path), mode="interactive")
+    p.job("a", messages=[{"role": "user", "content": "x"}], model="gpt-4o").execute()
+    p.job("b", messages=[{"role": "user", "content": "y"}], model="gpt-4o").execute()
+    summary = p.usage_summary(job_keys=["b"])
+    assert summary["prompt_tokens"] == 1
+    assert summary["completion_tokens"] == 1
+    assert summary["total_tokens"] == 2
+    assert summary["requests"] == 1
+
+
 def test_job_keys_empty_before_any_job(tmp_path):
     p = Pipeline(state_dir=str(tmp_path), mode="interactive")
     assert p.job_keys() == []
