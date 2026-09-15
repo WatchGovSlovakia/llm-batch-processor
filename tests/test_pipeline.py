@@ -74,6 +74,25 @@ def test_usage_summary_aggregates_across_jobs(tmp_path, fake_providers):
     assert summary["requests"] == 2
 
 
+def test_job_keys_empty_before_any_job(tmp_path):
+    p = Pipeline(state_dir=str(tmp_path), mode="interactive")
+    assert p.job_keys() == []
+
+
+def test_job_keys_returns_submitted_and_completed_keys(tmp_path, fake_providers):
+    p = Pipeline(state_dir=str(tmp_path), mode="interactive")
+    p.job("a", messages=[{"role": "user", "content": "x"}], model="gpt-4o").execute()
+    p.job("b", messages=[{"role": "user", "content": "y"}], model="gpt-4o").execute()
+    assert sorted(p.job_keys()) == ["a", "b"]
+
+
+def test_job_keys_excludes_pipeline_meta_file(tmp_path, fake_providers):
+    p = Pipeline(state_dir=str(tmp_path), mode="interactive")
+    p.job("a", messages=[{"role": "user", "content": "x"}], model="gpt-4o").execute()
+    assert p.job_keys() == ["a"]
+    assert "pipeline" not in p.job_keys()
+
+
 def test_save_meta_merges_extra_fields(tmp_path):
     p = Pipeline(state_dir=str(tmp_path), mode="batch")
     p.save_meta({"pdf_url": "http://x/doc.pdf", "deadline": "2026-06-15"})

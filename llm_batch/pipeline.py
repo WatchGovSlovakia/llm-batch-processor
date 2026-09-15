@@ -96,6 +96,10 @@ class Pipeline:
             total['requests'] += 1
         return total
 
+    def job_keys(self) -> list[str]:
+        """Every job key persisted in this pipeline's state dir (any state)."""
+        return [handle.get("key") for handle in self._backend.iter_jobs()]
+
     def finish(self) -> None:
         """Delete this pipeline's local state files."""
         for handle in list(self._backend.iter_jobs()):
