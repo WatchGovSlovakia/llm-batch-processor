@@ -120,6 +120,8 @@ class Pipeline:
         """
         cancelled = []
         for key in self.job_keys():
+            if key is None:
+                continue  # malformed state file with no key
             if self.job(key).abandon(reason):
                 cancelled.append(key)
         return cancelled

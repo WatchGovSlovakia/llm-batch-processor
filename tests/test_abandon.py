@@ -52,6 +52,9 @@ def test_abandon_sent_non_cancellable_fails_without_cancel(tmp_path, prov):
 def test_abandon_cancel_requested_does_not_recancel(tmp_path, prov):
     job = _sent_job(tmp_path)
     job._state["state"] = Job.CANCEL_REQUESTED
+    job._save()
+    job = Job(FileStorage(str(tmp_path)).for_job("x"), "x")  # reload persisted state
+    assert job.state == Job.CANCEL_REQUESTED
     assert job.abandon("gone") is True
     assert prov["cancel"] == []
     assert job.state == Job.FAILED
@@ -108,3 +111,33 @@ def test_abandon_all_returns_only_cancelled_keys(tmp_path, prov):
     assert p.job("anth").state == Job.FAILED
     assert p.job("done").state == Job.COMPLETED
     assert p.job("done").result == "ok"
+
+
+def test_abandon_all_skips_nonlive_and_handles_speculative(tmp_path, prov):
+    p = Pipeline(state_dir=str(tmp_path), mode="batch", fallback_strategy="speculative")
+    msgs = [{"role": "user", "content": "hi"}]
+    p.job("spec", messages=msgs, model="openai/gpt-4o").execute()
+    assert p.job("spec").snapshot()["fallback_strategy"] == "speculative"
+    p.job("failed", messages=msgs, model="openai/gpt-4o").execute()
+    p.job("failed").mark_failed("boom")
+    p.job("reset", messages=msgs, model="openai/gpt-4o").execute()
+    p.job("reset").mark_failed("boom")
+    p.job("reset").retry()  # persisted NOT_SENT
+    prov["cancel"].clear()
+
+    assert p.abandon_all() == ["spec"]
+    assert len(prov["cancel"]) == 1
+    assert p.job("spec").state == Job.FAILED
+    assert p.job("failed").state == Job.FAILED
+    assert p.job("failed").snapshot()["error_message"] == "boom"
+    assert p.job("reset").state == Job.NOT_SENT
+    assert p.job("reset").snapshot()["error_message"] is None
+
+
+def test_abandon_all_skips_keyless_state_file(tmp_path, prov):
+    p = Pipeline(state_dir=str(tmp_path), mode="batch")
+    p.job("live", messages=[{"role": "user", "content": "hi"}],
+          model="openai/gpt-4o").execute()
+    (tmp_path / "junk.json").write_text("{}")  # malformed: no "key"
+    assert None in p.job_keys()
+    assert p.abandon_all() == ["live"]
