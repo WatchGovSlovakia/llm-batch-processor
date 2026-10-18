@@ -68,6 +68,16 @@ Speculative cancellation is delegated to litellm and supported for **OpenAI, Azu
 
 Tuning knobs (all hours): `poll_interval_hours`, `interactive_runtime_estimate_hours`, `cancel_margin_hours` (provider-aware default), `cancel_resolution_timeout_hours` (provider-aware backstop for a cancel that never settles).
 
+### Abandoning jobs
+
+`Job.abandon(reason)` cancels a live batch the caller no longer wants, and `Pipeline.abandon_all(reason)` does so for every job in the pipeline (returning the keys a provider cancel was issued for). Per state:
+
+- `SENT` — asks the provider to cancel (OpenAI, Azure, Vertex AI) and marks the job `FAILED` locally with `reason`; returns `True`. For providers litellm cannot cancel (Anthropic) it only marks the job `FAILED` and returns `False`.
+- `CANCEL_REQUESTED` — the cancel was already issued; marks the job `FAILED` and returns `True`.
+- `NOT_SENT`, `COMPLETED`, `FAILED` — no-op, returns `False`. A `COMPLETED` job's result is never altered.
+
+This is best-effort and fire-and-forget: the provider may still finish (and bill) a batch if the cancel does not take effect, and Anthropic batches cannot be cancelled at all. If the provider cancel raises (e.g. `TransientProviderError`), the exception propagates and the job stays `SENT` so the call can be retried.
+
 ### Per-request results
 
 `Job.items` (after completion) lists one dict per request, in request order, for both

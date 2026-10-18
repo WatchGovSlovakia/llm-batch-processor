@@ -213,6 +213,25 @@ class Job:
         self._mark_failed(message, self._batch_handle(),
                           self._state.get("output_file_id"))
 
+    def abandon(self, reason: str = "abandoned by caller") -> bool:
+        """Best-effort cancel of a live provider batch, then mark the job FAILED.
+
+        Returns True if a provider cancel was issued (or had already been, in
+        CANCEL_REQUESTED), False if the provider cannot cancel or nothing was
+        live (NOT_SENT / COMPLETED / FAILED are left untouched). A raising
+        cancel propagates and leaves the job SENT so the caller can retry.
+        """
+        state = self.state
+        if state not in (self.SENT, self.CANCEL_REQUESTED):
+            return False
+        handle = self._batch_handle()
+        cancelled = state == self.CANCEL_REQUESTED  # cancel already issued
+        if state == self.SENT and providers.provider_supports_cancel(handle.provider):
+            providers.cancel(handle)
+            cancelled = True
+        self._mark_failed(reason, handle, self._state.get("output_file_id"))
+        return cancelled
+
     # --- internals ------------------------------------------------------
 
     def _provider(self) -> str:

@@ -113,6 +113,17 @@ class Pipeline:
         """Every job key persisted in this pipeline's state dir (any state)."""
         return [handle.get("key") for handle in self._backend.iter_jobs()]
 
+    def abandon_all(self, reason: str = "abandoned by caller") -> list[str]:
+        """Abandon every job in this pipeline; return keys a provider cancel was issued for.
+
+        Stops at the first exception from Job.abandon (which propagates).
+        """
+        cancelled = []
+        for key in self.job_keys():
+            if self.job(key).abandon(reason):
+                cancelled.append(key)
+        return cancelled
+
     def finish(self) -> None:
         """Delete this pipeline's local state files."""
         for handle in list(self._backend.iter_jobs()):
