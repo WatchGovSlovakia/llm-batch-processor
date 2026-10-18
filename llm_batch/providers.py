@@ -61,6 +61,8 @@ class PollResult:
     # Scalar: populated for a single-request batch job; None for a bundle
     # response until/unless a future consumer needs per-item values.
     finish_reason: str | None = None
+    # Per-request {text, finish_reason, usage, cost}, in request order.
+    items: list[dict] | None = None
 
 
 @dataclass
@@ -71,6 +73,7 @@ class CompletionResult:
     usage: dict
     cost: dict
     finish_reason: str | None = None
+    cached_tokens: int = 0
 
 
 def provider_of(model: str) -> str:
@@ -84,28 +87,78 @@ def provider_of(model: str) -> str:
     return "openai"
 
 
-def _price_from_usage(model: str, usage: dict) -> float:
-    """Interactive (non-batch) USD for this usage, via litellm.cost_per_token."""
+# How batch pricing treats provider-cached input tokens. Set from measurements
+# (pdf2md spike, docs/findings/2026-10-16-gemini-cost-spike.md, R2):
+#   "batch_only"       batch discount on every token, no cache discount
+#   "stack"            cache discount and batch discount multiply
+#   "cache_precedence" cached tokens at the cache rate, the rest at the batch rate
+BATCH_CACHE_POLICY = "batch_only"
+
+
+def _price(model: str, prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -> float:
+    """Interactive (non-batch) USD via litellm.cost_per_token; cached tokens at the cache-read rate."""
     try:
-        prompt_cost, completion_cost = litellm.cost_per_token(
-            model=model,
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
-        )
+        kw = {"model": model, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+        if cached_tokens:
+            kw["cache_read_input_tokens"] = cached_tokens
+        prompt_cost, completion_cost = litellm.cost_per_token(**kw)
         return float(prompt_cost + completion_cost)
     except Exception:
         return 0.0
 
 
+def _price_from_usage(model: str, usage: dict) -> float:
+    """Interactive (non-batch) USD for this usage, via litellm.cost_per_token."""
+    return _price(model, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
+                  usage.get("cached_tokens", 0))
+
+
 def _cost_dict(model: str, usage: dict, *, batch: bool) -> dict:
     """Build the {charged_usd, interactive_usd, saved_usd} triple."""
-    interactive_usd = _price_from_usage(model, usage)
-    charged_usd = interactive_usd * BATCH_RATE if batch else interactive_usd
+    prompt = usage.get("prompt_tokens", 0)
+    completion = usage.get("completion_tokens", 0)
+    cached = usage.get("cached_tokens", 0)
+    interactive_usd = _price(model, prompt, completion, cached)
+    if not batch:
+        charged_usd = interactive_usd
+    elif not cached or BATCH_CACHE_POLICY == "stack":
+        charged_usd = interactive_usd * BATCH_RATE
+    elif BATCH_CACHE_POLICY == "batch_only":
+        charged_usd = _price(model, prompt, completion) * BATCH_RATE
+    elif BATCH_CACHE_POLICY == "cache_precedence":
+        uncached_usd = _price(model, prompt - cached, completion)
+        charged_usd = (interactive_usd - uncached_usd) + uncached_usd * BATCH_RATE
+    else:
+        raise ValueError(f"unknown BATCH_CACHE_POLICY {BATCH_CACHE_POLICY!r}")
     return {
         "charged_usd": charged_usd,
         "interactive_usd": interactive_usd,
         "saved_usd": interactive_usd - charged_usd,
     }
+
+
+def _cached_tokens(usage) -> int:
+    """Provider-reported cached prompt tokens (OpenAI prompt_tokens_details.cached_tokens)."""
+    if usage is None:
+        return 0
+    details = (usage.get("prompt_tokens_details") if isinstance(usage, dict)
+               else getattr(usage, "prompt_tokens_details", None))
+    if details is None:
+        return 0
+    value = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
+    return int(value or 0)
+
+
+def _item(model: str, text: str, finish_reason, raw_usage, *, batch: bool) -> dict:
+    usage = {**_usage_dict(raw_usage), "cached_tokens": _cached_tokens(raw_usage)}
+    return {"text": text, "finish_reason": finish_reason, "usage": usage,
+            "cost": _cost_dict(model, usage, batch=batch)}
+
+
+def completion_item(cr: CompletionResult) -> dict:
+    """Per-request item for an interactive completion (same shape as PollResult.items)."""
+    return {"text": cr.text, "finish_reason": cr.finish_reason,
+            "usage": {**cr.usage, "cached_tokens": cr.cached_tokens}, "cost": dict(cr.cost)}
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -208,9 +261,11 @@ def complete(model: str, messages: list, **kw) -> CompletionResult:
     choice = response.choices[0]
     text = choice.message.content
     usage = _usage_dict(response.usage)
-    cost = _cost_dict(model, usage, batch=False)
+    cached = _cached_tokens(response.usage)
+    cost = _cost_dict(model, {**usage, "cached_tokens": cached}, batch=False)
     finish_reason = getattr(choice, "finish_reason", None)
-    return CompletionResult(text=text, usage=usage, cost=cost, finish_reason=finish_reason)
+    return CompletionResult(text=text, usage=usage, cost=cost, finish_reason=finish_reason,
+                            cached_tokens=cached)
 
 
 def _usage_dict(usage) -> dict:
@@ -289,6 +344,7 @@ def poll_batch(handle: BatchHandle) -> PollResult:
     raw = content.text if hasattr(content, "text") else content.content.decode()
     results_by_id: dict[str, str] = {}
     finish_reasons_by_id: dict[str, str | None] = {}
+    items_by_id: dict[str, dict] = {}
     total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     for line in raw.splitlines():
         if not line.strip():
@@ -308,6 +364,8 @@ def poll_batch(handle: BatchHandle) -> PollResult:
         body = response["body"]
         results_by_id[custom_id] = body["choices"][0]["message"]["content"]
         finish_reasons_by_id[custom_id] = body["choices"][0].get("finish_reason")
+        items_by_id[custom_id] = _item(handle.model, results_by_id[custom_id],
+                                       finish_reasons_by_id[custom_id], body.get("usage"), batch=True)
         usage = _usage_dict(body.get("usage"))
         total["prompt_tokens"] += usage["prompt_tokens"]
         total["completion_tokens"] += usage["completion_tokens"]
@@ -317,6 +375,7 @@ def poll_batch(handle: BatchHandle) -> PollResult:
     # request (spec §5.4 — n_requests lets us confirm we got every result).
     expected = handle.n_requests if handle.n_requests is not None else len(results_by_id)
     texts = []
+    items = []
     for i in range(expected):
         custom_id = f"req-{i}"
         if custom_id not in results_by_id:
@@ -325,14 +384,15 @@ def poll_batch(handle: BatchHandle) -> PollResult:
                 error_message=(f"missing result for {custom_id} "
                                f"({len(results_by_id)}/{expected} returned)"))
         texts.append(results_by_id[custom_id])
-    cost = _cost_dict(handle.model, total, batch=True)
+        items.append(items_by_id[custom_id])
+    cost = {k: sum(item["cost"][k] for item in items) for k in ("charged_usd", "interactive_usd", "saved_usd")}
     # Scalar finish_reason only makes sense for a single-request batch
     # (the only usage shape any known caller has today); a multi-request/
     # bundle response leaves it None (spec §2 — PollResult.finish_reason).
     finish_reason = finish_reasons_by_id.get("req-0") if len(texts) == 1 else None
     return PollResult(
         status="completed", texts=texts, usage=total, cost=cost,
-        output_file_id=output_file_id, finish_reason=finish_reason)
+        output_file_id=output_file_id, finish_reason=finish_reason, items=items)
 
 
 def cleanup(handle: BatchHandle) -> None:

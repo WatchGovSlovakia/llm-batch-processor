@@ -414,3 +414,72 @@ def test_poll_batch_completed_missing_finish_reason_key_is_none(litellm_mock):
                           batch_job_id="b1", n_requests=1)
     result = providers.poll_batch(handle)
     assert result.finish_reason is None
+
+
+# --- per-request items, cached tokens, batch cache pricing --------------------------
+
+def test_cached_tokens_from_object_and_dict():
+    assert providers._cached_tokens(None) == 0
+    assert providers._cached_tokens({"prompt_tokens": 5}) == 0
+    assert providers._cached_tokens({"prompt_tokens_details": {"cached_tokens": 7}}) == 7
+    obj = make_obj(prompt_tokens=5, prompt_tokens_details=make_obj(cached_tokens=3))
+    assert providers._cached_tokens(obj) == 3
+    assert providers._cached_tokens(make_obj(prompt_tokens_details=None)) == 0
+
+
+def test_complete_reports_cached_tokens(litellm_mock):
+    usage = make_obj(prompt_tokens=100, completion_tokens=10, total_tokens=110,
+                     prompt_tokens_details=make_obj(cached_tokens=60))
+    litellm_mock.completion = lambda **k: completion_response("hi", usage=usage, finish_reason="stop")
+    cr = providers.complete("gpt-4o", [{"role": "user", "content": "x"}])
+    assert cr.cached_tokens == 60
+    assert cr.usage == {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
+    assert providers.completion_item(cr) == {
+        "text": "hi", "finish_reason": "stop",
+        "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110, "cached_tokens": 60},
+        "cost": cr.cost}
+
+
+def test_poll_batch_bundle_has_per_request_items(litellm_mock):
+    usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+             "prompt_tokens_details": {"cached_tokens": 4}}
+    litellm_mock.retrieve_batch = lambda **k: make_obj(status="completed", output_file_id="files/out")
+    litellm_mock.file_content = lambda **k: batch_output_jsonl(
+        ["a", "b"], usage=usage, finish_reasons=["stop", "length"])
+    res = providers.poll_batch(BatchHandle(provider="openai", model="gpt-4o",
+                                           batch_job_id="b1", n_requests=2))
+    assert res.status == "completed" and res.finish_reason is None
+    assert [i["text"] for i in res.items] == ["a", "b"]
+    assert [i["finish_reason"] for i in res.items] == ["stop", "length"]
+    assert res.items[1]["usage"] == {"prompt_tokens": 10, "completion_tokens": 5,
+                                     "total_tokens": 15, "cached_tokens": 4}
+    assert res.usage == {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
+
+
+def _fake_prices(**k):
+    """prompt: uncached 1.0/token, cached 0.1/token; completion 2.0/token."""
+    cached = k.get("cache_read_input_tokens", 0)
+    return ((k["prompt_tokens"] - cached) * 1.0 + cached * 0.1, k["completion_tokens"] * 2.0)
+
+
+@pytest.mark.parametrize("policy,charged", [
+    ("batch_only", 60.0),        # 0.5 * (100 + 20)
+    ("stack", 33.0),             # 0.5 * (40 + 6 + 20)
+    ("cache_precedence", 36.0),  # 6 + 0.5 * (40 + 20)
+])
+def test_batch_cost_policy_for_cached_tokens(litellm_mock, monkeypatch, policy, charged):
+    litellm_mock.cost_per_token = _fake_prices
+    monkeypatch.setattr(providers, "BATCH_CACHE_POLICY", policy)
+    usage = {"prompt_tokens": 100, "completion_tokens": 10, "cached_tokens": 60}
+    cost = providers._cost_dict("m", usage, batch=True)
+    assert cost["interactive_usd"] == pytest.approx(66.0)
+    assert cost["charged_usd"] == pytest.approx(charged)
+    assert cost["saved_usd"] == pytest.approx(66.0 - charged)
+
+
+def test_batch_cost_without_cached_tokens_is_unchanged(litellm_mock, monkeypatch):
+    litellm_mock.cost_per_token = _fake_prices
+    for policy in ("batch_only", "stack", "cache_precedence"):
+        monkeypatch.setattr(providers, "BATCH_CACHE_POLICY", policy)
+        cost = providers._cost_dict("m", {"prompt_tokens": 100, "completion_tokens": 10}, batch=True)
+        assert cost["charged_usd"] == pytest.approx(60.0)

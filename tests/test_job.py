@@ -342,3 +342,52 @@ def test_pipeline_job_forwards_max_tokens_and_thinking(tmp_path, fake_providers)
     job.execute()
     assert fake_providers["submit_kwargs"]["max_tokens"] == 4000
     assert fake_providers["submit_kwargs"]["thinking"] == {"type": "disabled"}
+
+
+# --- per-request items ----------------------------------------------------------------
+
+def test_items_none_before_completion(tmp_path, fake_providers):
+    job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="batch")
+    job.execute()
+    assert job.items is None
+
+
+def test_interactive_bundle_items_keep_per_request_finish_reason(tmp_path, fake_providers, monkeypatch):
+    replies = iter([("one", "stop", 3), ("two", "length", 0)])
+
+    def complete(model, messages, **kw):
+        text, finish, cached = next(replies)
+        return CompletionResult(text=text, finish_reason=finish, cached_tokens=cached,
+                                usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+                                cost={"charged_usd": 0.1, "interactive_usd": 0.1, "saved_usd": 0.0})
+    monkeypatch.setattr(job_module.providers, "complete", complete)
+    job = Job(_handle(tmp_path), "x", requests=[[{"role": "user", "content": "a"}],
+                                                [{"role": "user", "content": "b"}]],
+              model="gpt-4o", mode="interactive")
+    assert job.execute() == ["one", "two"]
+    assert job.finish_reason is None
+    assert [i["finish_reason"] for i in job.items] == ["stop", "length"]
+    assert [i["usage"]["cached_tokens"] for i in job.items] == [3, 0]
+    reloaded = Job(FileStorage(str(tmp_path)).for_job("x"), "x")
+    assert reloaded.items == job.items
+
+
+def test_batch_bundle_items_are_persisted(tmp_path, fake_providers, monkeypatch):
+    items = [{"text": "p1", "finish_reason": "stop", "usage": {}, "cost": {}},
+             {"text": "p2", "finish_reason": "length", "usage": {}, "cost": {}}]
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+        status="completed", texts=["p1", "p2"], usage={}, cost={}, output_file_id="o", items=items))
+    job = Job(_handle(tmp_path), "x", requests=[[{"role": "user", "content": "a"}],
+                                                [{"role": "user", "content": "b"}]],
+              model="gpt-4o", mode="batch")
+    job.execute()
+    job.execute()
+    assert Job(FileStorage(str(tmp_path)).for_job("x"), "x").items == items
+
+
+def test_single_job_has_one_item(tmp_path, fake_providers):
+    job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="interactive")
+    job.execute()
+    assert [i["text"] for i in job.items] == ["interactive answer"]

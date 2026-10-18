@@ -68,6 +68,16 @@ Speculative cancellation is delegated to litellm and supported for **OpenAI, Azu
 
 Tuning knobs (all hours): `poll_interval_hours`, `interactive_runtime_estimate_hours`, `cancel_margin_hours` (provider-aware default), `cancel_resolution_timeout_hours` (provider-aware backstop for a cancel that never settles).
 
+### Per-request results
+
+`Job.items` (after completion) lists one dict per request, in request order, for both
+single and bundle jobs:
+`{"text", "finish_reason", "usage": {"prompt_tokens", "completion_tokens", "total_tokens",
+"cached_tokens"}, "cost": {"charged_usd", "interactive_usd", "saved_usd"}}`.
+`cached_tokens` is the provider-reported cached prompt count
+(`prompt_tokens_details.cached_tokens`). How cached tokens are priced inside batch jobs is set
+by `providers.BATCH_CACHE_POLICY` (`batch_only` | `stack` | `cache_precedence`).
+
 ## Cron / polling
 
 Two patterns, one core:

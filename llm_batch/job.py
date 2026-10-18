@@ -59,7 +59,7 @@ _PERSISTED_FIELDS = (
     "input_file_id", "output_file_id", "submitted_at", "completed_at", "deadline",
     "actual_mode", "response", "usage", "cost", "finish_reason", "error_message",
     "poll_attempts", "rerun_cmd", "cleanup_provider_files",
-    "fallback_strategy", "payload", "litellm_kwargs", "cancel_requested_at",
+    "fallback_strategy", "payload", "litellm_kwargs", "cancel_requested_at", "items",
 )
 
 
@@ -159,6 +159,14 @@ class Job:
     @property
     def finish_reason(self) -> str | None:
         return self._state.get('finish_reason')
+
+    @property
+    def items(self) -> list[dict] | None:
+        """Per-request {text, finish_reason, usage (incl. cached_tokens), cost}, in request order."""
+        if self.state != self.COMPLETED:
+            return None
+        items = self._state.get("items")
+        return [dict(i) for i in items] if items is not None else None
 
     def snapshot(self) -> dict:
         return dict(self._state)
@@ -288,6 +296,7 @@ class Job:
             "payload": None,
             "litellm_kwargs": None,
             "cancel_requested_at": None,
+            "items": None,
         }
 
     def _save(self) -> None:
@@ -314,6 +323,7 @@ class Job:
 
     def _submit_interactive(self):
         texts = []
+        items = []
         usage = dict(_ZERO_USAGE)
         cost = dict(_ZERO_COST)
         last_finish_reason = None
@@ -321,6 +331,7 @@ class Job:
             for messages in self._payload:
                 cr = providers.complete(self._model, messages, **self._kw)
                 texts.append(cr.text)
+                items.append(providers.completion_item(cr))
                 _accumulate(usage, cr.usage)
                 _accumulate_cost(cost, cr.cost)
                 last_finish_reason = cr.finish_reason
@@ -331,7 +342,7 @@ class Job:
         state = self._base_state()
         state.update(state=self.COMPLETED, actual_mode="interactive",
                      completed_at=_now_iso(), response=response,
-                     usage=usage, cost=cost,
+                     usage=usage, cost=cost, items=items,
                      finish_reason=None if self._is_bundle else last_finish_reason)
         self._state = state
         self._save()
@@ -394,7 +405,7 @@ class Job:
         response = result.texts if self._is_bundle else result.texts[0]
         self._state.update(
             state=self.COMPLETED, response=response, completed_at=_now_iso(),
-            usage=result.usage, cost=result.cost,
+            usage=result.usage, cost=result.cost, items=result.items,
             finish_reason=None if self._is_bundle else result.finish_reason,
             output_file_id=result.output_file_id, error_message=None)
         self._save()  # persist BEFORE provider-side cleanup (spec §7.1)
@@ -482,6 +493,7 @@ class Job:
     def _reissue_interactive(self, handle):
         """Re-run the persisted request interactively and mark COMPLETED."""
         texts = []
+        items = []
         usage = dict(_ZERO_USAGE)
         cost = dict(_ZERO_COST)
         last_finish_reason = None
@@ -489,6 +501,7 @@ class Job:
             for messages in self._payload:
                 cr = providers.complete(self._model, messages, **self._kw)
                 texts.append(cr.text)
+                items.append(providers.completion_item(cr))
                 _accumulate(usage, cr.usage)
                 _accumulate_cost(cost, cr.cost)
                 last_finish_reason = cr.finish_reason
@@ -499,7 +512,7 @@ class Job:
         response = texts if self._is_bundle else texts[0]
         self._state.update(
             state=self.COMPLETED, actual_mode="interactive",
-            completed_at=_now_iso(), response=response, usage=usage, cost=cost,
+            completed_at=_now_iso(), response=response, usage=usage, cost=cost, items=items,
             finish_reason=None if self._is_bundle else last_finish_reason,
             error_message=None)
         self._save()
