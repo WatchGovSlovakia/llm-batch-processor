@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -166,7 +167,7 @@ class Job:
         if self.state != self.COMPLETED:
             return None
         items = self._state.get("items")
-        return [dict(i) for i in items] if items is not None else None
+        return copy.deepcopy(items) if items is not None else None
 
     def snapshot(self) -> dict:
         return dict(self._state)

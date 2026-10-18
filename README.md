@@ -76,7 +76,9 @@ single and bundle jobs:
 "cached_tokens"}, "cost": {"charged_usd", "interactive_usd", "saved_usd"}}`.
 `cached_tokens` is the provider-reported cached prompt count
 (`prompt_tokens_details.cached_tokens`). How cached tokens are priced inside batch jobs is set
-by `providers.BATCH_CACHE_POLICY` (`batch_only` | `stack` | `cache_precedence`).
+by `providers.BATCH_CACHE_POLICY` (`batch_only` | `stack` | `cache_precedence`); an unknown value raises `ValueError`.
+With `batch_only` and heavy caching, `saved_usd` can be negative: the interactive reference
+price is cache-discounted while the batch charge is not.
 
 ## Cron / polling
 

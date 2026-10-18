@@ -391,3 +391,17 @@ def test_single_job_has_one_item(tmp_path, fake_providers):
               model="gpt-4o", mode="interactive")
     job.execute()
     assert [i["text"] for i in job.items] == ["interactive answer"]
+
+
+def test_items_returns_a_deep_copy(tmp_path, fake_providers, monkeypatch):
+    monkeypatch.setattr(job_module.providers, "complete", lambda model, messages, **kw: CompletionResult(
+        text="t", finish_reason="stop", cached_tokens=1,
+        usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        cost={"charged_usd": 0.1, "interactive_usd": 0.1, "saved_usd": 0.0}))
+    job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
+              model="gpt-4o", mode="interactive")
+    job.execute()
+    job.items[0]["usage"]["prompt_tokens"] = 999
+    job.items[0]["cost"]["charged_usd"] = 999
+    assert job.items[0]["usage"]["prompt_tokens"] == 1
+    assert job.items[0]["cost"]["charged_usd"] == 0.1
