@@ -483,3 +483,57 @@ def test_batch_cost_without_cached_tokens_is_unchanged(litellm_mock, monkeypatch
         monkeypatch.setattr(providers, "BATCH_CACHE_POLICY", policy)
         cost = providers._cost_dict("m", {"prompt_tokens": 100, "completion_tokens": 10}, batch=True)
         assert cost["charged_usd"] == pytest.approx(60.0)
+
+
+# --- provider-reported cost -------------------------------------------------
+
+def _usage_with_cost(cost):
+    return {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105, "cost": cost}
+
+
+def test_complete_prefers_provider_reported_cost(litellm_mock):
+    litellm_mock.completion = lambda **k: completion_response("x", _usage_with_cost(1.165e-05))
+    litellm_mock.cost_per_token = lambda **k: (0.0, 0.0)  # unknown to litellm
+    cost = providers.complete("openrouter/qwen/qwen3.8-flash", [{"role": "user", "content": "q"}]).cost
+    assert cost["charged_usd"] == pytest.approx(1.165e-05)
+    assert cost["saved_usd"] == 0.0
+    assert cost["cost_source"] == "provider"
+
+
+def test_complete_provider_cost_beats_litellm_price(litellm_mock):
+    litellm_mock.completion = lambda **k: completion_response("x", _usage_with_cost(0.5))
+    litellm_mock.cost_per_token = lambda **k: (0.01, 0.02)
+    cost = providers.complete("openrouter/m", [{"role": "user", "content": "q"}]).cost
+    assert cost["charged_usd"] == pytest.approx(0.5)
+    assert cost["cost_source"] == "provider"
+
+
+def test_complete_without_provider_cost_uses_litellm(litellm_mock):
+    litellm_mock.completion = lambda **k: completion_response("x", {
+        "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150})
+    litellm_mock.cost_per_token = lambda **k: (0.01, 0.02)
+    cost = providers.complete("gpt-4o", [{"role": "user", "content": "q"}]).cost
+    assert cost["charged_usd"] == pytest.approx(0.03)
+    assert cost["cost_source"] == "litellm"
+
+
+def test_zero_price_with_tokens_is_unknown_and_warns(litellm_mock, caplog):
+    litellm_mock.completion = lambda **k: completion_response("x", {
+        "prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105})
+    litellm_mock.cost_per_token = lambda **k: (0.0, 0.0)
+    with caplog.at_level("WARNING"):
+        cost = providers.complete("openrouter/unknown/model", [{"role": "user", "content": "q"}]).cost
+    assert cost["cost_source"] == "unknown"
+    assert cost["charged_usd"] == 0.0
+    assert "unknown/model" in caplog.text
+
+
+def test_zero_tokens_zero_price_is_not_unknown(litellm_mock):
+    cost = providers._cost_dict("m", {"prompt_tokens": 0, "completion_tokens": 0}, batch=False)
+    assert cost["cost_source"] == "litellm"
+
+
+def test_batch_cost_dict_has_cost_source(litellm_mock):
+    litellm_mock.cost_per_token = lambda **k: (0.01, 0.02)
+    cost = providers._cost_dict("m", {"prompt_tokens": 10, "completion_tokens": 1}, batch=True)
+    assert cost["cost_source"] == "litellm"

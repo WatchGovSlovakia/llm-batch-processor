@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 from dataclasses import dataclass
 
 import litellm
 
 from llm_batch.errors import TransientProviderError
+
+logger = logging.getLogger(__name__)
 
 # Flat per-token batch discount: you pay this fraction of the interactive price.
 # All three providers apply ~50% independent of batch size (see spec §10).
@@ -113,8 +116,27 @@ def _price_from_usage(model: str, usage: dict) -> float:
                   usage.get("cached_tokens", 0))
 
 
-def _cost_dict(model: str, usage: dict, *, batch: bool) -> dict:
-    """Build the {charged_usd, interactive_usd, saved_usd} triple."""
+def _provider_cost(raw_usage) -> float | None:
+    """USD the provider itself billed (e.g. OpenRouter's ``usage.cost``), or None."""
+    if raw_usage is None:
+        return None
+    value = (raw_usage.get("cost") if isinstance(raw_usage, dict)
+             else getattr(raw_usage, "cost", None))
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _cost_dict(model: str, usage: dict, *, batch: bool, provider_usd: float | None = None) -> dict:
+    """Build {charged_usd, interactive_usd, saved_usd, cost_source}.
+
+    cost_source: "provider" (billed cost reported by the provider), "litellm"
+    (litellm price table) or "unknown" (tokens were used but no price is known;
+    the USD values are then 0.0 and must not be read as free).
+    """
+    if provider_usd is not None and not batch:
+        return {"charged_usd": provider_usd, "interactive_usd": provider_usd,
+                "saved_usd": 0.0, "cost_source": "provider"}
     prompt = usage.get("prompt_tokens", 0)
     completion = usage.get("completion_tokens", 0)
     cached = usage.get("cached_tokens", 0)
@@ -130,10 +152,16 @@ def _cost_dict(model: str, usage: dict, *, batch: bool) -> dict:
         charged_usd = (interactive_usd - uncached_usd) + uncached_usd * BATCH_RATE
     else:
         raise ValueError(f"unknown BATCH_CACHE_POLICY {BATCH_CACHE_POLICY!r}")
+    source = "litellm"
+    if interactive_usd <= 0 and (prompt or completion):
+        source = "unknown"
+        logger.warning("no price known for model %r (%d prompt + %d completion tokens); "
+                       "cost reported as 0.0 with cost_source='unknown'", model, prompt, completion)
     return {
         "charged_usd": charged_usd,
         "interactive_usd": interactive_usd,
         "saved_usd": interactive_usd - charged_usd,
+        "cost_source": source,
     }
 
 
@@ -262,7 +290,8 @@ def complete(model: str, messages: list, **kw) -> CompletionResult:
     text = choice.message.content
     usage = _usage_dict(response.usage)
     cached = _cached_tokens(response.usage)
-    cost = _cost_dict(model, {**usage, "cached_tokens": cached}, batch=False)
+    cost = _cost_dict(model, {**usage, "cached_tokens": cached}, batch=False,
+                      provider_usd=_provider_cost(response.usage))
     finish_reason = getattr(choice, "finish_reason", None)
     return CompletionResult(text=text, usage=usage, cost=cost, finish_reason=finish_reason,
                             cached_tokens=cached)
