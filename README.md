@@ -64,7 +64,7 @@ sent, and returns the stored result once complete. Exit codes for cron:
 - `"conservative"` (default) — decide once at submit time: if `deadline − now < max_batch_turnaround_hours`, run interactively instead of batching. Safe, but forgoes the batch discount within a day or two of the deadline.
 - `"speculative"` — submit the batch optimistically and only cancel + re-run interactively at the last responsible moment, dropping the effective margin to roughly `poll_interval + cancel_margin + interactive_runtime_estimate`. Captures the discount in the common (fast) case.
 
-Speculative cancellation is delegated to litellm and supported for **OpenAI, Azure, and Vertex AI** (requires `litellm>=1.83.0`). For **Anthropic**, which litellm cannot cancel, a speculative job transparently degrades to `conservative` (with a one-time warning).
+Speculative cancellation is delegated to litellm and supported for **OpenAI, Azure, and Vertex AI** (requires `litellm>=1.83.0`). For **Anthropic**, which litellm cannot cancel, and **OpenRouter**, whose Batch API has no cancel endpoint, a speculative job transparently degrades to `conservative` (with a one-time warning).
 
 Tuning knobs (all hours): `poll_interval_hours`, `interactive_runtime_estimate_hours`, `cancel_margin_hours` (provider-aware default), `cancel_resolution_timeout_hours` (provider-aware backstop for a cancel that never settles).
 
@@ -72,7 +72,7 @@ Tuning knobs (all hours): `poll_interval_hours`, `interactive_runtime_estimate_h
 
 `Job.abandon(reason)` cancels a live batch the caller no longer wants, and `Pipeline.abandon_all(reason)` does so for every job in the pipeline (returning the keys a provider cancel was issued for). Per state:
 
-- `SENT` — asks the provider to cancel (OpenAI, Azure, Vertex AI) and marks the job `FAILED` locally with `reason`; returns `True`. For providers litellm cannot cancel (Anthropic) it only marks the job `FAILED` and returns `False`.
+- `SENT` — asks the provider to cancel (OpenAI, Azure, Vertex AI) and marks the job `FAILED` locally with `reason`; returns `True`. For providers that cannot cancel (Anthropic, OpenRouter) it only marks the job `FAILED` and returns `False`.
 - `CANCEL_REQUESTED` — the cancel was already issued; marks the job `FAILED` and returns `True`.
 - `NOT_SENT`, `COMPLETED`, `FAILED` — no-op, returns `False`. A `COMPLETED` job's result is never altered.
 
@@ -115,10 +115,46 @@ The library is **filesystem-only and never touches git** — you own
 ## Provider-side cleanup
 
 After a result is durably saved, provider-side batch artifacts are deleted by
-default (`cleanup_provider_files=True`): OpenAI file objects (quota) and Vertex
-GCS objects (billing). Gemini-API and Anthropic auto-expire (no-op).
+default (`cleanup_provider_files=True`): OpenAI file objects (quota), Vertex
+GCS objects (billing) and OpenRouter batches (stored requests and results).
+Gemini-API and Anthropic auto-expire (no-op).
 
 See `examples/government_contracts/` for a full GitHub Actions deployment.
+
+## OpenRouter batch
+
+`model="openrouter/<vendor>/<model>"` with `mode="batch"` submits through
+OpenRouter's own Batch API (direct HTTP; litellm has no OpenRouter batch
+support). Use the model's normal slug, e.g. `openrouter/anthropic/claude-haiku-5.5`,
+so the same string also works for the interactive deadline fallback. The model
+needs a batch variant ([list](https://openrouter.ai/models?variant=batch)); one
+without it fails at submit with `400`. Research and probe results are in
+`docs/research/openrouter-batch.md`.
+
+- **Env:** `OPENROUTER_API_KEY` (required). `OPENROUTER_API_BASE` is optional and
+  defaults to `https://openrouter.ai/api/v1`.
+- **Cost:** `cost_source="provider"`. `charged_usd` is what OpenRouter billed
+  (the batch's `usage.cost`), split across requests by token share. `interactive_usd`
+  is estimated as `charged / providers.BATCH_RATES["openrouter"]` (0.5, OpenRouter's
+  "typically 50%"; a few models differ).
+- **No cancel:** `speculative` degrades to `conservative`, and `abandon()` cannot stop
+  a running batch, which is still billed.
+- **No inline images:** base64/data-URI images are rejected (the batch ends
+  `failed`). Send public `https` image URLs, which the upstream provider fetches
+  when it runs the batch (possibly hours later).
+- **Limits:** one model per batch, 200 MB body (`413`). Per-account request and
+  in-progress caps are not published (`413`/`429`, retried as transient).
+  `completion_window` is always `24h`, but Google Vertex can take up to 96h,
+  which is longer than the poller's default `max_batch_age_days=3`.
+- **Errors:** `429`/`5xx`/network are transient. `401`/`402` (bad key, not enough
+  credits) raise and leave the job's state unchanged; top up and re-run. A `404`
+  on poll is retried (a just-created batch can briefly 404). `410` (past the
+  30-day retention) fails the job.
+- `llm-batch poll --sweep-orphans N` deletes terminal OpenRouter batches older
+  than N days that have no local state, when the state tree has OpenRouter jobs.
+  Every key in a workspace sees the same batches, so this can delete batches
+  that other tools in the workspace submitted.
+- Live test (opt-in, ~$0.000002): `LLM_BATCH_LIVE=1 OPENROUTER_API_KEY=… pytest tests/test_openrouter_live.py`.
 
 ## Vertex AI setup
 

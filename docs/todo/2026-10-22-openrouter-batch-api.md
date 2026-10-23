@@ -1,5 +1,21 @@
 # TODO: OpenRouter Batch API provider
 
+**Status (2026-10-24): partly done.** Points 1-6 and 8 are implemented on
+`feat/openrouter-batch` (direct HTTP via httpx, no cancel, provider-reported cost,
+per-provider `BATCH_RATES`). The open questions are answered in
+[`docs/research/openrouter-batch.md`](../research/openrouter-batch.md); the README has an
+"OpenRouter batch" section. What remains:
+
+- **Point 7 (pdf2md), not done here.** Add `openrouter` to pdf2md's
+  `BATCH_CAPABLE_PROVIDERS` (`src/pdf2md/config.py`), update the tests that expect
+  openrouter+batch to be rejected, and bump the llm-batch pin.
+- **Images.** OpenRouter batch rejects base64/data-URI images, and pdf2md sends page
+  images as `data:image/png;base64,...` (`src/pdf2md/llm.py`). Its LLM pages need
+  public https image URLs (hosted page images) before openrouter batch can work for them.
+- **Unverified limits:** max requests per batch, max body size, and the actual turnaround
+  for non-Vertex providers. Vertex-routed batches may take up to 96 h, longer than the
+  default `max_batch_age_days=3` orphan sweep; see the research note.
+
 OpenRouter now has a delayed (async) batch API. Supporting it would give llm-batch a
 batch path for any model OpenRouter serves this way. Example: `anthropic/claude-haiku-5.5`,
 listed as `anthropic/claude-haiku-5.5:batch`.
