@@ -3,10 +3,10 @@
 Public API:
     Job, Pipeline, Poller            — core
     FileStorage, PostgresStorage     — storage backends
-    BatchJobFailed, TransientProviderError  — errors
+    BatchJobFailed, TransientProviderError, OpenRouterAPIError  — errors
 """
 
-from llm_batch.errors import BatchJobFailed, TransientProviderError
+from llm_batch.errors import BatchJobFailed, OpenRouterAPIError, TransientProviderError
 from llm_batch.job import Job
 from llm_batch.pipeline import Pipeline
 from llm_batch.poller import Poller
@@ -21,4 +21,5 @@ __all__ = [
     "PostgresStorage",
     "BatchJobFailed",
     "TransientProviderError",
+    "OpenRouterAPIError",
 ]

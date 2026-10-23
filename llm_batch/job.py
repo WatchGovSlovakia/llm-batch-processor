@@ -266,7 +266,7 @@ class Job:
         _SPECULATIVE_DOWNGRADE_WARNED.add(provider)
         _LOG.warning(
             "speculative fallback_strategy is unavailable for provider %r "
-            "(litellm cannot cancel its batches); falling back to conservative.",
+            "(its batches cannot be cancelled); falling back to conservative.",
             provider)
 
     def _effective_strategy(self) -> str:

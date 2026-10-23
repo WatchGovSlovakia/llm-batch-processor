@@ -10,20 +10,36 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
+import time
 from dataclasses import dataclass
 
+import httpx
 import litellm
 
-from llm_batch.errors import TransientProviderError
+from llm_batch.errors import OpenRouterAPIError, TransientProviderError
 
 logger = logging.getLogger(__name__)
 
 # Flat per-token batch discount: you pay this fraction of the interactive price.
-# All three providers apply ~50% independent of batch size (see spec §10).
+# The litellm providers apply ~50% independent of batch size (see spec §10).
+# BATCH_RATE is the fallback for a provider missing from BATCH_RATES.
 BATCH_RATE = 0.5
+# OpenRouter: "typically 50%" of the sync price, set per model (66 of 75 `:batch`
+# variants are exactly 0.5 on 2026-10-24; docs/research/openrouter-batch.md). Its
+# charged cost is provider-reported, so this rate only estimates interactive_usd.
+BATCH_RATES = {"openai": 0.5, "azure": 0.5, "vertex_ai": 0.5, "gemini": 0.5,
+               "anthropic": 0.5, "openrouter": 0.5}
+
+
+def batch_rate(provider: str) -> float:
+    """Fraction of the interactive price a batch request costs for this provider."""
+    return BATCH_RATES.get(provider, BATCH_RATE)
+
 
 # Providers whose batch jobs litellm can cancel (litellm>=1.83.0 adds Vertex).
 # Anthropic and gemini are absent: they fall back to the conservative strategy.
+# OpenRouter is absent too: its Batch API has no cancel endpoint.
 _CANCELLABLE = {"openai", "azure", "vertex_ai"}
 
 
@@ -134,9 +150,15 @@ def _cost_dict(model: str, usage: dict, *, batch: bool, provider_usd: float | No
     (litellm price table) or "unknown" (tokens were used but no price is known;
     the USD values are then 0.0 and must not be read as free).
     """
+    rate = batch_rate(provider_of(model))
     if provider_usd is not None and not batch:
         return {"charged_usd": provider_usd, "interactive_usd": provider_usd,
                 "saved_usd": 0.0, "cost_source": "provider"}
+    if provider_usd is not None:
+        # Billed batch cost; the interactive reference is estimated from the rate.
+        interactive_usd = provider_usd / rate if rate else provider_usd
+        return {"charged_usd": provider_usd, "interactive_usd": interactive_usd,
+                "saved_usd": interactive_usd - provider_usd, "cost_source": "provider"}
     prompt = usage.get("prompt_tokens", 0)
     completion = usage.get("completion_tokens", 0)
     cached = usage.get("cached_tokens", 0)
@@ -144,12 +166,12 @@ def _cost_dict(model: str, usage: dict, *, batch: bool, provider_usd: float | No
     if not batch:
         charged_usd = interactive_usd
     elif not cached or BATCH_CACHE_POLICY == "stack":
-        charged_usd = interactive_usd * BATCH_RATE
+        charged_usd = interactive_usd * rate
     elif BATCH_CACHE_POLICY == "batch_only":
-        charged_usd = _price(model, prompt, completion) * BATCH_RATE
+        charged_usd = _price(model, prompt, completion) * rate
     elif BATCH_CACHE_POLICY == "cache_precedence":
         uncached_usd = _price(model, prompt - cached, completion)
-        charged_usd = (interactive_usd - uncached_usd) + uncached_usd * BATCH_RATE
+        charged_usd = (interactive_usd - uncached_usd) + uncached_usd * rate
     else:
         raise ValueError(f"unknown BATCH_CACHE_POLICY {BATCH_CACHE_POLICY!r}")
     source = "litellm"
@@ -177,10 +199,11 @@ def _cached_tokens(usage) -> int:
     return int(value or 0)
 
 
-def _item(model: str, text: str, finish_reason, raw_usage, *, batch: bool) -> dict:
+def _item(model: str, text: str, finish_reason, raw_usage, *, batch: bool,
+          provider_usd: float | None = None) -> dict:
     usage = {**_usage_dict(raw_usage), "cached_tokens": _cached_tokens(raw_usage)}
     return {"text": text, "finish_reason": finish_reason, "usage": usage,
-            "cost": _cost_dict(model, usage, batch=batch)}
+            "cost": _cost_dict(model, usage, batch=batch, provider_usd=provider_usd)}
 
 
 def completion_item(cr: CompletionResult) -> dict:
@@ -191,6 +214,8 @@ def completion_item(cr: CompletionResult) -> dict:
 
 def _is_transient(exc: Exception) -> bool:
     """Classify a provider exception as retryable (transient) vs terminal."""
+    if isinstance(exc, TransientProviderError):
+        return True
     status = getattr(exc, "status_code", None)
     if status in _TRANSIENT_STATUS:
         return True
@@ -200,6 +225,7 @@ def _is_transient(exc: Exception) -> bool:
 
 # Re-exported so tests/callers can reference providers.TransientProviderError.
 TransientProviderError = TransientProviderError
+OpenRouterAPIError = OpenRouterAPIError
 
 
 def _bare_model(model: str) -> str:
@@ -208,6 +234,11 @@ def _bare_model(model: str) -> str:
     litellm's routing string (Vertex derives the model resource path from this field)."""
     prefix = f"{provider_of(model)}/"
     return model[len(prefix):] if model.startswith(prefix) else model
+
+
+def _request_body(messages: list, **kw) -> dict:
+    """One chat-completions request body; kwargs merged in."""
+    return {"messages": messages, **kw}
 
 
 def _build_jsonl(model: str, requests: list, **kw) -> str:
@@ -219,7 +250,7 @@ def _build_jsonl(model: str, requests: list, **kw) -> str:
             "custom_id": f"req-{i}",
             "method": "POST",
             "url": "/v1/chat/completions",
-            "body": {"model": bare_model, "messages": messages, **kw},
+            "body": {"model": bare_model, **_request_body(messages, **kw)},
         }))
     return "\n".join(lines) + "\n"
 
@@ -232,6 +263,8 @@ def submit_batch(model: str, requests: list, **kw) -> BatchHandle:
     are forwarded into each request body.
     """
     provider = provider_of(model)
+    if provider == "openrouter":
+        return _submit_openrouter(model, requests, **kw)
     try:
         jsonl = _build_jsonl(model, requests, **kw)
         file_obj = litellm.create_file(
@@ -267,6 +300,8 @@ def cancel(handle: BatchHandle) -> None:
     (the job transitions through CANCEL_REQUESTED). Transient errors are wrapped so
     the caller can leave the job in place and retry on the next scheduled poll.
     """
+    if handle.provider == "openrouter":
+        raise NotImplementedError("the OpenRouter Batch API has no cancel endpoint")
     try:
         litellm.cancel_batch(
             batch_id=handle.batch_job_id,
@@ -334,6 +369,8 @@ def poll_batch(handle: BatchHandle) -> PollResult:
     polling (spec §8.1).
     """
     provider = handle.provider
+    if provider == "openrouter":
+        return _poll_openrouter(handle)
     try:
         batch = litellm.retrieve_batch(
             batch_id=handle.batch_job_id, custom_llm_provider=provider)
@@ -371,10 +408,7 @@ def poll_batch(handle: BatchHandle) -> PollResult:
         raise
 
     raw = content.text if hasattr(content, "text") else content.content.decode()
-    results_by_id: dict[str, str] = {}
-    finish_reasons_by_id: dict[str, str | None] = {}
     items_by_id: dict[str, dict] = {}
-    total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     for line in raw.splitlines():
         if not line.strip():
             continue
@@ -391,34 +425,34 @@ def poll_batch(handle: BatchHandle) -> PollResult:
                 status="failed", output_file_id=output_file_id,
                 error_message=f"{custom_id}: request failed with status {status_code}")
         body = response["body"]
-        results_by_id[custom_id] = body["choices"][0]["message"]["content"]
-        finish_reasons_by_id[custom_id] = body["choices"][0].get("finish_reason")
-        items_by_id[custom_id] = _item(handle.model, results_by_id[custom_id],
-                                       finish_reasons_by_id[custom_id], body.get("usage"), batch=True)
-        usage = _usage_dict(body.get("usage"))
-        total["prompt_tokens"] += usage["prompt_tokens"]
-        total["completion_tokens"] += usage["completion_tokens"]
-        total["total_tokens"] += usage["total_tokens"]
+        items_by_id[custom_id] = _item(handle.model, body["choices"][0]["message"]["content"],
+                                       body["choices"][0].get("finish_reason"), body.get("usage"),
+                                       batch=True)
+    return _completed(handle, items_by_id, output_file_id)
 
+
+def _completed(handle: BatchHandle, items_by_id: dict, output_file_id: str | None) -> PollResult:
+    """Order per-request items req-0..req-N into a completed PollResult (or fail on a gap)."""
     # Verify completeness: a "completed" batch must yield every submitted
     # request (spec §5.4 — n_requests lets us confirm we got every result).
-    expected = handle.n_requests if handle.n_requests is not None else len(results_by_id)
-    texts = []
+    expected = handle.n_requests if handle.n_requests is not None else len(items_by_id)
     items = []
     for i in range(expected):
         custom_id = f"req-{i}"
-        if custom_id not in results_by_id:
+        if custom_id not in items_by_id:
             return PollResult(
                 status="failed", output_file_id=output_file_id,
                 error_message=(f"missing result for {custom_id} "
-                               f"({len(results_by_id)}/{expected} returned)"))
-        texts.append(results_by_id[custom_id])
+                               f"({len(items_by_id)}/{expected} returned)"))
         items.append(items_by_id[custom_id])
+    texts = [item["text"] for item in items]
+    total = {k: sum(item["usage"][k] for item in items)
+             for k in ("prompt_tokens", "completion_tokens", "total_tokens")}
     cost = {k: sum(item["cost"][k] for item in items) for k in ("charged_usd", "interactive_usd", "saved_usd")}
     # Scalar finish_reason only makes sense for a single-request batch
     # (the only usage shape any known caller has today); a multi-request/
     # bundle response leaves it None (spec §2 — PollResult.finish_reason).
-    finish_reason = finish_reasons_by_id.get("req-0") if len(texts) == 1 else None
+    finish_reason = items[0]["finish_reason"] if len(items) == 1 else None
     return PollResult(
         status="completed", texts=texts, usage=total, cost=cost,
         output_file_id=output_file_id, finish_reason=finish_reason, items=items)
@@ -428,10 +462,18 @@ def cleanup(handle: BatchHandle) -> None:
     """Delete provider-side batch artifacts. Best-effort; never raises.
 
     Per spec §7: OpenAI deletes file objects (quota); Vertex deletes GCS objects
-    (billing); Gemini-API and Anthropic auto-expire so this is a no-op.
+    (billing); OpenRouter deletes the batch (stored requests and results, which
+    otherwise expire after 30 days); Gemini-API and Anthropic auto-expire so this
+    is a no-op.
     """
     provider = handle.provider
-    if provider == "openai":
+    if provider == "openrouter":
+        try:
+            # Allowed on terminal batches only; a still-running one answers 409.
+            _openrouter_http("DELETE", f"/batches/{handle.batch_job_id}")
+        except Exception:
+            pass  # best-effort: result is already persisted before we get here
+    elif provider == "openai":
         for file_id in (handle.input_file_id, handle.output_file_id):
             if not file_id:
                 continue
@@ -470,14 +512,15 @@ def _delete_gcs_object(uri: str) -> None:
 def cleanup_orphans(provider: str, live_ids: set, older_than_days: int) -> list[str]:
     """Best-effort sweep of provider-side files with no live local state.
 
-    Implemented for OpenAI (file objects) via the openai SDK; a no-op for other
-    providers (Vertex/Anthropic/Gemini), where listing is provider-specific or
-    unnecessary. Returns the list of deleted ids. Never raises.
+    Implemented for OpenAI (file objects) via the openai SDK and for OpenRouter
+    (terminal batches); a no-op for other providers (Vertex/Anthropic/Gemini),
+    where listing is provider-specific or unnecessary. Returns the list of
+    deleted ids. Never raises.
     """
+    if provider == "openrouter":
+        return _openrouter_orphans(live_ids, older_than_days)
     if provider != "openai":
         return []
-    import time
-
     try:
         from openai import OpenAI
 
@@ -498,3 +541,154 @@ def cleanup_orphans(provider: str, live_ids: set, older_than_days: int) -> list[
         return deleted
     except Exception:
         return []
+
+
+# --- OpenRouter Batch API ----------------------------------------------------
+# litellm (1.106) has no OpenRouter batch support, and OpenRouter's batch flow is
+# not OpenAI's: requests go inline in the create call (no JSONL file), results
+# come back inline in GET /batches/{id}, and there is no cancel endpoint. So this
+# talks to the HTTP API directly. See docs/research/openrouter-batch.md.
+
+_OPENROUTER_DEFAULT_BASE = "https://openrouter.ai/api/v1"
+_OPENROUTER_TIMEOUT = httpx.Timeout(300.0, connect=30.0)  # batch bodies can be ~200 MB
+# Tests swap in an httpx.MockTransport; None means real network.
+_OPENROUTER_TRANSPORT = None
+# OpenRouter statuses that end a batch (the only ones DELETE accepts).
+_OPENROUTER_TERMINAL = ("completed", "failed", "expired", "cancelled")
+
+
+def _openrouter_http(method: str, path: str, *, json: dict | None = None,
+                     params=None) -> dict:
+    """One OpenRouter API call; returns the JSON body.
+
+    Raises OpenRouterAPIError on a non-2xx status (classified by _is_transient)
+    and TransientProviderError on a network failure.
+    """
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise OpenRouterAPIError(401, "OPENROUTER_API_KEY is not set")
+    base = os.environ.get("OPENROUTER_API_BASE") or _OPENROUTER_DEFAULT_BASE
+    try:
+        with httpx.Client(transport=_OPENROUTER_TRANSPORT, timeout=_OPENROUTER_TIMEOUT) as client:
+            response = client.request(method, base.rstrip("/") + path, json=json, params=params,
+                                      headers={"Authorization": f"Bearer {key}"})
+    except httpx.TransportError as exc:
+        raise TransientProviderError(f"OpenRouter {method} {path}: {exc}") from exc
+    if response.is_success:
+        return response.json()
+    try:
+        message = response.json()["error"]["message"]
+    except Exception:
+        message = response.text[:500]
+    raise OpenRouterAPIError(response.status_code, message)
+
+
+def _submit_openrouter(model: str, requests: list, **kw) -> BatchHandle:
+    """Create an OpenRouter batch with the requests inline (no file upload)."""
+    payload = {
+        # OpenRouter reads the body as a stream: `requests` must come last.
+        "endpoint": "/v1/chat/completions",
+        "model": _bare_model(model),
+        "completion_window": "24h",
+        "requests": [{"custom_id": f"req-{i}", "body": _request_body(messages, **kw)}
+                     for i, messages in enumerate(requests)],
+    }
+    try:
+        batch = _openrouter_http("POST", "/batches", json=payload)
+    except Exception as exc:
+        if _is_transient(exc):
+            raise TransientProviderError(str(exc)) from exc
+        raise
+    return BatchHandle(provider="openrouter", model=model, batch_job_id=batch["id"],
+                       input_file_id=None, n_requests=len(requests))
+
+
+def _poll_openrouter(handle: BatchHandle) -> PollResult:
+    """Poll an OpenRouter batch; a terminal batch carries its results inline."""
+    try:
+        batch = _openrouter_http("GET", f"/batches/{handle.batch_job_id}")
+    except Exception as exc:
+        status_code = getattr(exc, "status_code", None)
+        # 404 also answers a GET sent right after the create (live probe 2026-10-24),
+        # so it is retried; a really deleted batch then ends as stale in the Poller.
+        if _is_transient(exc) or status_code == 404:
+            return PollResult(status="transient_error", error_message=str(exc))
+        if status_code == 410:  # results deleted after the 30-day retention
+            return PollResult(status="failed", error_message=str(exc))
+        raise  # 401/402 etc.: run-level, the job stays SENT
+
+    status = batch.get("status")
+    results = batch.get("results")
+    if status in _PENDING_STATUSES or (status == "completed" and results is None):
+        return PollResult(status="pending")
+    error = (batch.get("error") or {}).get("message")
+    if status in _CANCELED_STATUSES:
+        return PollResult(status="canceled",
+                          error_message=f"batch {handle.batch_job_id} reported status={status}")
+    if status != "completed":
+        detail = "" if status in _FAILED_STATUSES else "unknown "
+        return PollResult(status="failed", error_message=(
+            f"batch {handle.batch_job_id} {detail}status={status}" + (f": {error}" if error else "")))
+
+    for result in results:
+        if result.get("error"):
+            err = result["error"]
+            return PollResult(status="failed", error_message=(
+                f"{result.get('custom_id')}: {err.get('message', err) if isinstance(err, dict) else err}"))
+    costs = _openrouter_costs(results, batch.get("usage"))
+    items_by_id = {}
+    for result in results:
+        body = result["response"]["body"]
+        choice = body["choices"][0]
+        items_by_id[result["custom_id"]] = _item(
+            handle.model, choice["message"]["content"], choice.get("finish_reason"),
+            body.get("usage"), batch=True, provider_usd=costs.get(result["custom_id"]))
+    return _completed(handle, items_by_id, None)
+
+
+def _openrouter_costs(results: list, batch_usage: dict | None) -> dict:
+    """Billed USD per custom_id.
+
+    Per-result usage carries no `cost` today (live probe, 2026-10-24); only the
+    batch-level `usage.cost` does. It is split by each request's share of the
+    batch's total tokens: the sum is exact, the split is an approximation.
+    """
+    usages = {r["custom_id"]: (r["response"]["body"].get("usage") or {}) for r in results}
+    costs = {cid: _provider_cost(u) for cid, u in usages.items()}
+    if all(c is not None for c in costs.values()):
+        return costs
+    total_usd = _provider_cost(batch_usage)
+    if total_usd is None:
+        return {}
+    tokens = {cid: _usage_dict(u)["total_tokens"] or 0 for cid, u in usages.items()}
+    total_tokens = sum(tokens.values())
+    if not total_tokens:
+        return {cid: total_usd / len(usages) for cid in usages}
+    return {cid: total_usd * n / total_tokens for cid, n in tokens.items()}
+
+
+def _openrouter_orphans(live_ids: set, older_than_days: int) -> list[str]:
+    """Delete terminal OpenRouter batches older than the cutoff with no live state.
+
+    Every API key in a workspace sees (and can delete) the same batches.
+    """
+    deleted, after = [], None
+    try:
+        params = [("status", s) for s in _OPENROUTER_TERMINAL]
+        params += [("created_before", int(time.time() - older_than_days * 86400)), ("limit", 100)]
+        while True:
+            page = _openrouter_http("GET", "/batches",
+                                    params=params + ([("after", after)] if after else []))
+            for batch in page.get("data", []):
+                if batch["id"] in live_ids:
+                    continue
+                try:
+                    _openrouter_http("DELETE", f"/batches/{batch['id']}")
+                    deleted.append(batch["id"])
+                except Exception:
+                    pass
+            if not page.get("has_more") or not page.get("last_id"):
+                return deleted
+            after = page["last_id"]
+    except Exception:
+        return deleted
