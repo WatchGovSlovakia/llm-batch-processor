@@ -3,10 +3,12 @@
 Public API:
     Job, Pipeline, Poller            — core
     FileStorage, PostgresStorage     — storage backends
+    ImageHost, MongoImageHost, S3ImageHost — image hosting for OpenRouter batch
     BatchJobFailed, TransientProviderError, OpenRouterAPIError  — errors
 """
 
 from llm_batch.errors import BatchJobFailed, OpenRouterAPIError, TransientProviderError
+from llm_batch.images import ImageHost, MongoImageHost, S3ImageHost
 from llm_batch.job import Job
 from llm_batch.pipeline import Pipeline
 from llm_batch.poller import Poller
@@ -19,6 +21,9 @@ __all__ = [
     "Poller",
     "FileStorage",
     "PostgresStorage",
+    "ImageHost",
+    "MongoImageHost",
+    "S3ImageHost",
     "BatchJobFailed",
     "TransientProviderError",
     "OpenRouterAPIError",

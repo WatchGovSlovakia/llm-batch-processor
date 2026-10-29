@@ -47,6 +47,15 @@ def provider_supports_cancel(provider: str) -> bool:
     """True iff litellm.cancel_batch can cancel a batch for this provider."""
     return provider in _CANCELLABLE
 
+
+# Batch APIs that reject data-URI images and need them hosted at public URLs.
+_NEEDS_HOSTED_IMAGES = {"openrouter"}
+
+
+def batch_needs_hosted_images(provider: str) -> bool:
+    """True iff this provider's batch API only takes images as public URLs."""
+    return provider in _NEEDS_HOSTED_IMAGES
+
 # litellm error status codes / type-name fragments treated as retryable.
 _TRANSIENT_STATUS = {408, 409, 429, 500, 502, 503, 504}
 _TRANSIENT_NAME_FRAGMENTS = (

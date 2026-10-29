@@ -12,6 +12,10 @@ per-provider `BATCH_RATES`). The open questions are answered in
 - **Images.** OpenRouter batch rejects base64/data-URI images, and pdf2md sends page
   images as `data:image/png;base64,...` (`src/pdf2md/llm.py`). Its LLM pages need
   public https image URLs (hosted page images) before openrouter batch can work for them.
+  *Done in llm-batch (2026-10-28):* `image_host=` (`MongoImageHost`, `S3ImageHost`)
+  rewrites data URIs to hosted URLs at submit and deletes the images after the batch.
+  wd-gov-alpha has `ApiImageHost` (images stored through its API in Mongo); it is passed
+  once its worker sends batches. pdf2md needs none behind its exchange backend.
 - **Unverified limits:** max requests per batch, max body size, and the actual turnaround
   for non-Vertex providers. Vertex-routed batches may take up to 96 h, longer than the
   default `max_batch_age_days=3` orphan sweep; see the research note.

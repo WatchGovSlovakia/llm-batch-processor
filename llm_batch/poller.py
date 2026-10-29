@@ -16,11 +16,14 @@ class Poller:
 
     `backend` is a directory/namespace-level storage object exposing
     `iter_jobs()` (and `for_job`). `run_cmd` is injectable for testing; it
-    defaults to running the command list with subprocess.
+    defaults to running the command list with subprocess. `image_host` (the
+    one the jobs were submitted with) lets the poller delete a finished job's
+    hosted images and sweep orphaned ones.
     """
 
-    def __init__(self, backend, *, max_batch_age_days=3, run_cmd=None):
+    def __init__(self, backend, *, max_batch_age_days=3, run_cmd=None, image_host=None):
         self._backend = backend
+        self._image_host = image_host
         self._max_age = timedelta(days=max_batch_age_days)
         self._run = run_cmd if run_cmd is not None else _default_run
 
@@ -36,11 +39,11 @@ class Poller:
             # Staleness only force-fails SENT jobs; a CANCEL_REQUESTED job is
             # bounded instead by its cancel_resolution_timeout (re-issues interactively).
             if state == Job.SENT and self._is_stale(handle):
-                job = Job(handle)
+                job = Job(handle, image_host=self._image_host)
                 job.mark_failed(f"stale: no completion within {self._max_age.days}d")
                 continue
 
-            job = Job(handle)
+            job = Job(handle, image_host=self._image_host)
             try:
                 job.execute()  # polls once
             except BatchJobFailed:
@@ -65,14 +68,18 @@ class Poller:
         return (_now() - submitted_dt) > self._max_age
 
     def sweep_orphans(self, older_than_days: int = 3) -> dict:
-        """Best-effort deletion of provider-side files with no live local state."""
+        """Best-effort deletion of provider-side files with no live local state,
+        and of hosted images (key "images") no unfinished job still needs."""
         live_ids: set[str] = set()
+        live_images: set[str] = set()
         provider_set: set[str] = set()
         for handle in self._backend.iter_jobs():
             for field in ("batch_job_id", "input_file_id", "output_file_id"):
                 value = handle.get(field)
                 if value:
                     live_ids.add(value)
+            if handle.get("state") in (Job.SENT, Job.CANCEL_REQUESTED):
+                live_images.update(handle.get("hosted_images") or ())
             model = handle.get("model")
             if model:
                 provider_set.add(providers.provider_of(model))
@@ -82,6 +89,11 @@ class Poller:
         for provider in provider_set:
             deleted[provider] = providers.cleanup_orphans(
                 provider, live_ids, older_than_days)
+        if self._image_host is not None:
+            try:
+                deleted["images"] = self._image_host.delete_orphans(live_images, older_than_days)
+            except Exception:
+                deleted["images"] = []
         return deleted
 
 

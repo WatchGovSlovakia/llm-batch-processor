@@ -6,7 +6,7 @@ import copy
 import logging
 from datetime import datetime, timedelta, timezone
 
-from llm_batch import providers
+from llm_batch import images, providers
 from llm_batch.errors import BatchJobFailed
 from llm_batch.providers import BatchHandle
 
@@ -61,6 +61,7 @@ _PERSISTED_FIELDS = (
     "actual_mode", "response", "usage", "cost", "finish_reason", "error_message",
     "poll_attempts", "rerun_cmd", "cleanup_provider_files",
     "fallback_strategy", "payload", "litellm_kwargs", "cancel_requested_at", "items",
+    "hosted_images",
 )
 
 
@@ -90,7 +91,7 @@ class Job:
                  fallback_strategy="conservative", poll_interval_hours=1.0,
                  interactive_runtime_estimate_hours=0.25,
                  cancel_margin_hours=None, cancel_resolution_timeout_hours=None,
-                 **litellm_kwargs):
+                 image_host=None, **litellm_kwargs):
         if messages is not None and requests is not None:
             raise ValueError("pass either messages= or requests=, not both")
 
@@ -116,6 +117,7 @@ class Job:
         self._interactive_estimate_h = interactive_runtime_estimate_hours
         self._cancel_margin_h = cancel_margin_hours
         self._cancel_resolution_timeout_h = cancel_resolution_timeout_hours
+        self._image_host = image_host
         self._state: dict = {}
 
         if self._storage.load():
@@ -317,6 +319,7 @@ class Job:
             "litellm_kwargs": None,
             "cancel_requested_at": None,
             "items": None,
+            "hosted_images": None,
         }
 
     def _save(self) -> None:
@@ -369,16 +372,22 @@ class Job:
         return response
 
     def _submit_batch(self, *, strategy="conservative"):
+        payload, hosted = self._payload, []
+        if self._image_host is not None and providers.batch_needs_hosted_images(self._provider()):
+            payload, hosted = images.externalize_images(self._payload, self._image_host)
         try:
-            handle = providers.submit_batch(self._model, self._payload, **self._kw)
-        except providers.TransientProviderError:
-            return None  # leave state NOT_SENT; retried next run
+            handle = providers.submit_batch(self._model, payload, **self._kw)
+        except BaseException as exc:
+            images.release_images(self._image_host, hosted)
+            if isinstance(exc, providers.TransientProviderError):
+                return None  # leave state NOT_SENT; retried next run
+            raise
 
         state = self._base_state()
         state.update(state=self.SENT, actual_mode="batch",
                      batch_job_id=handle.batch_job_id,
                      input_file_id=handle.input_file_id,
-                     fallback_strategy=strategy)
+                     fallback_strategy=strategy, hosted_images=hosted or None)
         if strategy == "speculative":
             # Persist enough to reconstruct and re-issue interactively from a
             # later scheduled poll (the poller rebuilds Job with no payload/kwargs).
@@ -429,6 +438,7 @@ class Job:
             finish_reason=None if self._is_bundle else result.finish_reason,
             output_file_id=result.output_file_id, error_message=None)
         self._save()  # persist BEFORE provider-side cleanup (spec §7.1)
+        self._release_images()
         if self._cleanup:
             handle.output_file_id = result.output_file_id
             try:
@@ -536,6 +546,7 @@ class Job:
             finish_reason=None if self._is_bundle else last_finish_reason,
             error_message=None)
         self._save()
+        self._release_images()
         if self._cleanup:
             try:
                 providers.cleanup(handle)  # remove the (cancelled) batch artifacts
@@ -550,6 +561,7 @@ class Job:
         if output_file_id:
             self._state["output_file_id"] = output_file_id
         self._save()
+        self._release_images()
         if handle is not None and self._cleanup:
             if output_file_id:
                 handle.output_file_id = output_file_id
@@ -557,3 +569,9 @@ class Job:
                 providers.cleanup(handle)
             except Exception:
                 pass
+
+    def _release_images(self):
+        """Delete this job's hosted images once its batch has ended. Without an
+        image_host (e.g. a poller built without one) they stay for the orphan sweep."""
+        if self._image_host is not None and self._state.get("hosted_images"):
+            images.release_images(self._image_host, self._state["hosted_images"])

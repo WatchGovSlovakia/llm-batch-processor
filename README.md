@@ -141,7 +141,7 @@ without it fails at submit with `400`. Research and probe results are in
   a running batch, which is still billed.
 - **No inline images:** base64/data-URI images are rejected (the batch ends
   `failed`). Send public `https` image URLs, which the upstream provider fetches
-  when it runs the batch (possibly hours later).
+  when it runs the batch (possibly hours later), or pass an `image_host` (below).
 - **Limits:** one model per batch, 200 MB body (`413`). Per-account request and
   in-progress caps are not published (`413`/`429`, retried as transient).
   `completion_window` is always `24h`, but Google Vertex can take up to 96h,
@@ -154,6 +154,30 @@ without it fails at submit with `400`. Research and probe results are in
   than N days that have no local state, when the state tree has OpenRouter jobs.
   Every key in a workspace sees the same batches, so this can delete batches
   that other tools in the workspace submitted.
+- **Image hosting:** with `image_host=` on `Pipeline`, `Job` or `Poller`, an
+  OpenRouter batch submit stores every data-URI `image_url` on the host and sends
+  its URL instead. The interactive path and other providers keep the inline
+  images. The images are deleted once the batch has completed or failed (also
+  when a failed submit leaves the job unsent). Ids are random and unguessable,
+  and the URL is the only access control. The image ids are in the job state
+  (`hosted_images`); `Poller.sweep_orphans` also deletes old images that no
+  running job needs (for example ones left by a crash before submit).
+
+  ```python
+  from llm_batch import MongoImageHost, S3ImageHost
+
+  # MongoDB (`pip install "llm-batch[mongo]"`): documents {_id, content_type, data, created_at}
+  # in `llm_images`. Your server must serve GET <public_base_url>/<id> from them.
+  host = MongoImageHost(pymongo.MongoClient(uri).wd, "https://example.org/api/v1/llm-images")
+  host.ensure_indexes(ttl_days=10)    # TTL backstop; keep it above the batch turnaround
+
+  # A publicly readable S3 bucket (`pip install "llm-batch[s3]"`), e.g. MinIO:
+  host = S3ImageHost(boto3.client("s3", endpoint_url=...), "bucket", "https://asset.example.org")
+
+  pipeline = Pipeline("./state", mode="batch", image_host=host)
+  ```
+
+  The URL has to be reachable from the internet. `localhost` in development is not.
 - Live test (opt-in, ~$0.000002): `LLM_BATCH_LIVE=1 OPENROUTER_API_KEY=… pytest tests/test_openrouter_live.py`.
 
 ## Vertex AI setup
