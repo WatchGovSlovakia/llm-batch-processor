@@ -12,7 +12,7 @@ def test_poll_command_invokes_poller(monkeypatch, tmp_path):
             calls["state_dir"] = backend._dir       # FileStorage stores dir in _dir
         def poll_all(self):
             calls["poll_all"] += 1
-            return {"advanced": []}
+            return {"advanced": [], "errors": []}
         def sweep_orphans(self, older_than_days):
             calls["sweep"] = older_than_days
 
@@ -32,7 +32,7 @@ def test_poll_command_with_sweep_orphans(monkeypatch, tmp_path):
         def __init__(self, backend, *, max_batch_age_days=3, run_cmd=None):
             pass
         def poll_all(self):
-            return {"advanced": []}
+            return {"advanced": [], "errors": []}
         def sweep_orphans(self, older_than_days):
             swept["days"] = older_than_days
 
@@ -49,7 +49,7 @@ def test_poll_command_custom_max_age(monkeypatch, tmp_path):
         def __init__(self, backend, *, max_batch_age_days=3, run_cmd=None):
             seen["max_age"] = max_batch_age_days
         def poll_all(self):
-            return {"advanced": []}
+            return {"advanced": [], "errors": []}
         def sweep_orphans(self, older_than_days):
             pass
 
@@ -61,3 +61,14 @@ def test_poll_command_custom_max_age(monkeypatch, tmp_path):
 def test_no_command_errors(monkeypatch):
     with pytest.raises(SystemExit):
         cli_module.main([])
+
+
+def test_poll_command_exits_nonzero_when_a_job_errored(monkeypatch, tmp_path):
+    class FakePoller:
+        def __init__(self, backend, *, max_batch_age_days=3, run_cmd=None):
+            pass
+        def poll_all(self):
+            return {"advanced": [], "errors": [{"key": "ocr", "rerun_cmd": None, "error": "401"}]}
+
+    monkeypatch.setattr(cli_module, "Poller", FakePoller)
+    assert cli_module.main(["poll", str(tmp_path)]) == 1

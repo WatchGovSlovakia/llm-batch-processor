@@ -75,10 +75,39 @@ class ProviderCredentials:
     api_key: str | None = field(default=None, repr=False)  # keep keys out of logs and tracebacks
     api_base: str | None = None
 
+    # One rule for "credentials vs. environment": a set (non-empty) field wins, else the env var.
+
+    def resolved(self, env_key: str, env_base: str, default_base: str | None = None):
+        """(api_key, api_base) for a call this module makes itself, with environment fallback."""
+        return (self.api_key or os.environ.get(env_key) or None,
+                self.api_base or os.environ.get(env_base) or default_base)
+
+    def litellm_kwargs(self) -> dict:
+        """The set fields as litellm `api_key`/`api_base` (litellm falls back to the env itself)."""
+        return {k: v for k, v in (("api_key", self.api_key), ("api_base", self.api_base)) if v}
+
 
 def _creds_for(credentials, provider: str):
     """The ProviderCredentials of `provider` in a {provider: ProviderCredentials} mapping, or None."""
     return (credentials or {}).get(provider)
+
+
+# Providers whose batch path (submit, poll, cancel, cleanup, orphan sweep) honours
+# ProviderCredentials. The others go through litellm's file/batch calls or SDK clients
+# that read only the environment, so credentials for them are refused rather than
+# silently ignored (which would bill whatever account the env key belongs to).
+_BATCH_CREDENTIALS = {"openrouter"}
+
+
+def _batch_creds(credentials, provider: str):
+    """`provider`'s credentials for a batch operation; ValueError if its batch path can't use them."""
+    creds = _creds_for(credentials, provider)
+    if creds is not None and provider not in _BATCH_CREDENTIALS:
+        raise ValueError(
+            f"credentials for {provider!r} are not supported on the batch path yet "
+            f"(only {', '.join(sorted(_BATCH_CREDENTIALS))}); set its environment variables "
+            f"or use mode='interactive'")
+    return creds
 
 
 @dataclass
@@ -287,11 +316,12 @@ def submit_batch(model: str, requests: list, *, credentials=None, **kw) -> Batch
     `requests` is a list of message-lists (a single-request job passes a
     one-element list). Extra kwargs (response_format, tools, temperature, ...)
     are forwarded into each request body. `credentials` ({provider: ProviderCredentials})
-    is used instead of the environment for providers this module calls itself (OpenRouter).
+    is used instead of the environment (OpenRouter only; ValueError for other providers).
     """
     provider = provider_of(model)
+    creds = _batch_creds(credentials, provider)
     if provider == "openrouter":
-        return _submit_openrouter(model, requests, creds=_creds_for(credentials, provider), **kw)
+        return _submit_openrouter(model, requests, creds=creds, **kw)
     try:
         jsonl = _build_jsonl(model, requests, **kw)
         file_obj = litellm.create_file(
@@ -319,7 +349,7 @@ def submit_batch(model: str, requests: list, *, credentials=None, **kw) -> Batch
     )
 
 
-def cancel(handle: BatchHandle) -> None:
+def cancel(handle: BatchHandle, *, credentials=None) -> None:
     """Initiate cancellation of a batch job and return immediately.
 
     Delegates to litellm for all providers (OpenAI/Azure/Vertex). Does NOT wait
@@ -327,6 +357,7 @@ def cancel(handle: BatchHandle) -> None:
     (the job transitions through CANCEL_REQUESTED). Transient errors are wrapped so
     the caller can leave the job in place and retry on the next scheduled poll.
     """
+    _batch_creds(credentials, handle.provider)  # refuse rather than cancel with the env key
     if handle.provider == "openrouter":
         raise NotImplementedError("the OpenRouter Batch API has no cancel endpoint")
     try:
@@ -343,11 +374,12 @@ def cancel(handle: BatchHandle) -> None:
 def complete(model: str, messages: list, *, credentials=None, **kw) -> CompletionResult:
     """Interactive path: one immediate completion with usage + cost.
 
-    The provider's ProviderCredentials in `credentials` go to litellm as `api_key`/`api_base`.
+    The provider's ProviderCredentials in `credentials` go to litellm as `api_key`/`api_base`;
+    an `api_key`/`api_base` passed explicitly in `kw` takes precedence over them.
     """
     creds = _creds_for(credentials, provider_of(model))
     if creds is not None:
-        kw = {**kw, **{k: v for k, v in (("api_key", creds.api_key), ("api_base", creds.api_base)) if v}}
+        kw = {**creds.litellm_kwargs(), **kw}
     try:
         response = litellm.completion(model=model, messages=messages, **kw)
     except Exception as exc:
@@ -402,8 +434,9 @@ def poll_batch(handle: BatchHandle, *, credentials=None) -> PollResult:
     polling (spec §8.1).
     """
     provider = handle.provider
+    creds = _batch_creds(credentials, provider)
     if provider == "openrouter":
-        return _poll_openrouter(handle, creds=_creds_for(credentials, provider))
+        return _poll_openrouter(handle, creds=creds)
     try:
         batch = litellm.retrieve_batch(
             batch_id=handle.batch_job_id, custom_llm_provider=provider)
@@ -497,14 +530,19 @@ def cleanup(handle: BatchHandle, *, credentials=None) -> None:
     Per spec §7: OpenAI deletes file objects (quota); Vertex deletes GCS objects
     (billing); OpenRouter deletes the batch (stored requests and results, which
     otherwise expire after 30 days); Gemini-API and Anthropic auto-expire so this
-    is a no-op.
+    is a no-op. Skipped (with a warning) when `credentials` hold keys for a provider
+    whose batch path can't use them, rather than deleting with the environment's account.
     """
     provider = handle.provider
+    try:
+        creds = _batch_creds(credentials, provider)
+    except ValueError as exc:
+        logger.warning("cleanup of batch %s skipped: %s", handle.batch_job_id, exc)
+        return
     if provider == "openrouter":
         try:
             # Allowed on terminal batches only; a still-running one answers 409.
-            _openrouter_http("DELETE", f"/batches/{handle.batch_job_id}",
-                             creds=_creds_for(credentials, provider))
+            _openrouter_http("DELETE", f"/batches/{handle.batch_job_id}", creds=creds)
         except Exception:
             pass  # best-effort: result is already persisted before we get here
     elif provider == "openai":
@@ -550,10 +588,16 @@ def cleanup_orphans(provider: str, live_ids: set, older_than_days: int, *,
     Implemented for OpenAI (file objects) via the openai SDK and for OpenRouter
     (terminal batches); a no-op for other providers (Vertex/Anthropic/Gemini),
     where listing is provider-specific or unnecessary. Returns the list of
-    deleted ids. Never raises.
+    deleted ids. Never raises. Skipped (with a warning) when `credentials` hold keys
+    for a provider whose sweep can't use them: the environment's account may be another one.
     """
+    try:
+        creds = _batch_creds(credentials, provider)
+    except ValueError as exc:
+        logger.warning("orphan sweep for %s skipped: %s", provider, exc)
+        return []
     if provider == "openrouter":
-        return _openrouter_orphans(live_ids, older_than_days, creds=_creds_for(credentials, provider))
+        return _openrouter_orphans(live_ids, older_than_days, creds=creds)
     if provider != "openai":
         return []
     try:
@@ -599,11 +643,10 @@ def _openrouter_http(method: str, path: str, *, json: dict | None = None,
     Raises OpenRouterAPIError on a non-2xx status (classified by _is_transient)
     and TransientProviderError on a network failure.
     """
-    key = (creds.api_key if creds else None) or os.environ.get("OPENROUTER_API_KEY")
+    key, base = (creds or ProviderCredentials()).resolved(
+        "OPENROUTER_API_KEY", "OPENROUTER_API_BASE", _OPENROUTER_DEFAULT_BASE)
     if not key:
         raise OpenRouterAPIError(401, "OPENROUTER_API_KEY is not set")
-    base = ((creds.api_base if creds else None) or os.environ.get("OPENROUTER_API_BASE")
-            or _OPENROUTER_DEFAULT_BASE)
     try:
         with httpx.Client(transport=_OPENROUTER_TRANSPORT, timeout=_OPENROUTER_TIMEOUT) as client:
             response = client.request(method, base.rstrip("/") + path, json=json, params=params,

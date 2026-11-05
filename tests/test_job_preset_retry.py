@@ -17,7 +17,7 @@ def fake_providers(monkeypatch):
 
     monkeypatch.setattr(job_module.providers, "submit_batch", submit_batch)
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
-    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: None)
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h, **_: None)
     return calls
 
 
@@ -48,7 +48,7 @@ def test_set_completed_noop_if_already_completed(tmp_path, fake_providers):
 
 def test_retry_resets_failed_to_not_sent(tmp_path, fake_providers, monkeypatch):
     monkeypatch.setattr(job_module.providers, "poll_batch",
-                        lambda h: PollResult(status="failed", error_message="expired"))
+                        lambda h, **_: PollResult(status="failed", error_message="expired"))
     job = Job(FileStorage(str(tmp_path)).for_job("x"), "x",
               messages=[{"role": "user", "content": "hi"}], model="gpt-4o", mode="batch")
     job.execute()                                   # SENT

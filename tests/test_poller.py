@@ -12,7 +12,7 @@ from datetime import timedelta
 @pytest.fixture
 def fake_providers(monkeypatch):
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
-    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: None)
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h, **_: None)
     return monkeypatch
 
 
@@ -35,7 +35,7 @@ def test_poll_all_advances_completed_pipeline_once(tmp_path, fake_providers):
     p = str(tmp_path / "doc1")
     _seed_sent_job(p, "ocr", "python go.py doc1")
     _seed_sent_job(p, "extract", "python go.py doc1")
-    fake_providers.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    fake_providers.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="completed", texts=["t"], usage={}, cost={}, output_file_id="o"))
 
     ran = []
@@ -48,7 +48,7 @@ def test_poll_all_advances_completed_pipeline_once(tmp_path, fake_providers):
 def test_poll_all_advances_distinct_pipelines(tmp_path, fake_providers):
     _seed_sent_job(str(tmp_path / "doc1"), "ocr", "python go.py doc1")
     _seed_sent_job(str(tmp_path / "doc2"), "ocr", "python go.py doc2")
-    fake_providers.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    fake_providers.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="completed", texts=["t"], usage={}, cost={}, output_file_id="o"))
 
     ran = []
@@ -59,7 +59,7 @@ def test_poll_all_advances_distinct_pipelines(tmp_path, fake_providers):
 def test_poll_all_no_rerun_when_still_pending(tmp_path, fake_providers):
     _seed_sent_job(str(tmp_path / "doc1"), "ocr", "python go.py doc1")
     fake_providers.setattr(job_module.providers, "poll_batch",
-                           lambda h: PollResult(status="pending"))
+                           lambda h, **_: PollResult(status="pending"))
     ran = []
     Poller(FileStorage(str(tmp_path)), run_cmd=lambda a: ran.append(a)).poll_all()
     assert ran == []
@@ -68,7 +68,7 @@ def test_poll_all_no_rerun_when_still_pending(tmp_path, fake_providers):
 def test_poll_all_no_rerun_on_failure(tmp_path, fake_providers):
     _seed_sent_job(str(tmp_path / "doc1"), "ocr", "python go.py doc1")
     fake_providers.setattr(job_module.providers, "poll_batch",
-                           lambda h: PollResult(status="failed", error_message="expired"))
+                           lambda h, **_: PollResult(status="failed", error_message="expired"))
     ran = []
     Poller(FileStorage(str(tmp_path)), run_cmd=lambda a: ran.append(a)).poll_all()
     assert ran == []
@@ -82,10 +82,10 @@ def test_stale_job_marked_failed_and_cleaned(tmp_path, fake_providers):
     _seed_sent_job(str(tmp_path / "doc1"), "ocr", "python go.py doc1", submitted_at=old)
     cleaned = []
     fake_providers.setattr(job_module.providers, "cleanup",
-                           lambda h: cleaned.append(h.batch_job_id))
+                           lambda h, **_: cleaned.append(h.batch_job_id))
     # poll_batch must NOT be called for a stale job
     fake_providers.setattr(job_module.providers, "poll_batch",
-                           lambda h: (_ for _ in ()).throw(AssertionError("polled a stale job")))
+                           lambda h, **_: (_ for _ in ()).throw(AssertionError("polled a stale job")))
     ran = []
     Poller(FileStorage(str(tmp_path)), max_batch_age_days=3,
            run_cmd=lambda a: ran.append(a)).poll_all()
@@ -100,7 +100,7 @@ def test_stale_job_marked_failed_and_cleaned(tmp_path, fake_providers):
 def test_sweep_orphans_delegates_per_provider(tmp_path, fake_providers):
     _seed_sent_job(str(tmp_path / "doc1"), "ocr", "python go.py doc1")
     seen = {}
-    def fake_cleanup_orphans(provider, live_ids, older_than_days):
+    def fake_cleanup_orphans(provider, live_ids, older_than_days, **_):
         seen[provider] = (set(live_ids), older_than_days)
         return []
     fake_providers.setattr(poller_module.providers, "cleanup_orphans", fake_cleanup_orphans)
@@ -129,7 +129,7 @@ def test_poller_advances_cancel_requested_jobs(tmp_path, fake_providers, monkeyp
         "litellm_kwargs": {}, "cancel_requested_at": _now().isoformat(),
     })
     monkeypatch.setattr(job_module.providers, "poll_batch",
-                        lambda h: PollResult(status="canceled"))
+                        lambda h, **_: PollResult(status="canceled"))
     monkeypatch.setattr(
         job_module.providers, "complete",
         lambda model, messages, **kw: CompletionResult(
@@ -140,3 +140,27 @@ def test_poller_advances_cancel_requested_jobs(tmp_path, fake_providers, monkeyp
     reloaded = Job(FileStorage(str(tmp_path)).for_job("c"))
     assert reloaded.state == Job.COMPLETED
     assert reloaded.snapshot()["actual_mode"] == "interactive"
+
+
+def test_poll_all_continues_after_a_job_error(tmp_path, fake_providers):
+    from llm_batch.errors import OpenRouterAPIError
+
+    _seed_sent_job(str(tmp_path / "doc1"), "ocr", "python go.py doc1")
+    _seed_sent_job(str(tmp_path / "doc2"), "ocr", "python go.py doc2")
+
+    def poll(h, **_):
+        if poll.calls == 0:
+            poll.calls += 1
+            raise OpenRouterAPIError(401, "OPENROUTER_API_KEY is not set")
+        return PollResult(status="completed", texts=["t"], usage={}, cost={}, output_file_id="o")
+    poll.calls = 0
+    fake_providers.setattr(job_module.providers, "poll_batch", poll)
+
+    ran = []
+    out = Poller(FileStorage(str(tmp_path)), run_cmd=lambda a: ran.append(a)).poll_all()
+    assert len(ran) == 1 and len(out["advanced"]) == 1     # the other job still advanced
+    assert len(out["errors"]) == 1 and "401" in out["errors"][0]["error"]
+    failed = out["errors"][0]["rerun_cmd"].split()[-1]
+    handle = FileStorage(str(tmp_path / failed)).for_job("ocr")
+    handle.load()
+    assert handle.get("state") == "sent"                     # left for the next run

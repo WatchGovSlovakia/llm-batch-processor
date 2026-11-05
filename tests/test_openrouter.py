@@ -426,3 +426,76 @@ def test_interactive_complete_passes_credentials_to_litellm(litellm_mock):
     cr = providers.complete(MODEL, [{"role": "user", "content": "hi"}], credentials=creds, temperature=0)
     assert cr.text == "ok"
     assert seen["api_key"] == "claim-key" and seen["api_base"] == "https://b/v1" and seen["temperature"] == 0
+
+
+# --- review follow-ups: per-job credentials_ref, refused non-OpenRouter batch credentials ---
+
+def test_explicit_litellm_api_key_wins_over_credentials(litellm_mock):
+    from tests.conftest import completion_response
+
+    seen = {}
+    litellm_mock.completion = lambda **kw: seen.update(kw) or completion_response("ok")
+    creds = {"openrouter": providers.ProviderCredentials(api_key="claim-key", api_base="https://b/v1")}
+    providers.complete(MODEL, [{"role": "user", "content": "hi"}], credentials=creds, api_key="explicit")
+    assert seen["api_key"] == "explicit" and seen["api_base"] == "https://b/v1"
+
+
+def test_batch_credentials_for_unsupported_provider_are_refused(litellm_mock):
+    creds = {"openai": providers.ProviderCredentials(api_key="k")}
+    handle = BatchHandle(provider="openai", model="gpt-4o", batch_job_id="b1", input_file_id="f1")
+    with pytest.raises(ValueError, match="not supported on the batch path"):
+        providers.submit_batch("gpt-4o", [[{"role": "user", "content": "hi"}]], credentials=creds)
+    with pytest.raises(ValueError):
+        providers.poll_batch(handle, credentials=creds)
+    with pytest.raises(ValueError):
+        providers.cancel(handle, credentials=creds)
+    # best-effort paths skip instead of touching the environment's account
+    deleted = []
+    litellm_mock.file_delete = lambda **k: deleted.append(k)
+    providers.cleanup(handle, credentials=creds)
+    assert deleted == []
+    assert providers.cleanup_orphans("openai", set(), 3, credentials=creds) == []
+
+
+def test_credentials_for_other_providers_do_not_block_openrouter(openrouter_mock):
+    creds = {"openai": providers.ProviderCredentials(api_key="k")}
+    openrouter_mock.routes[("POST", "/batches")] = {"id": "batch-1", "status": "validating"}
+    providers.submit_batch(MODEL, [[{"role": "user", "content": "hi"}]], credentials=creds)
+
+
+def test_credentials_ref_is_persisted_and_poller_resolves_per_job(tmp_path, openrouter_mock):
+    from llm_batch.poller import Poller
+
+    keys = {"ws1": providers.ProviderCredentials(api_key="k1"),
+            "ws2": providers.ProviderCredentials(api_key="k2")}
+    root = FileStorage(str(tmp_path))
+    openrouter_mock.routes[("POST", "/batches")] = {"id": "batch-1", "status": "validating"}
+    for ref in keys:
+        Job(root.for_job(ref), ref, messages=[{"role": "user", "content": "hi"}], model=MODEL,
+            mode="batch", credentials={"openrouter": keys[ref]}, credentials_ref=ref).execute()
+    assert Job(root.for_job("ws1")).credentials_ref == "ws1"
+    assert all("k1" not in f.read_text() and "k2" not in f.read_text()
+               for f in tmp_path.rglob("*") if f.is_file())
+
+    openrouter_mock.creds.clear()
+    openrouter_mock.routes[("GET", "/batches/batch-1")] = _batch("in_progress")
+    asked = []
+    Poller(root, credentials=lambda ref: asked.append(ref) or {"openrouter": keys[ref]}).poll_all()
+    assert sorted(asked) == ["ws1", "ws2"]
+    assert sorted(c.api_key for c in openrouter_mock.creds) == ["k1", "k2"]
+
+
+def test_poller_sweeps_orphans_once_per_credentials_ref(tmp_path, openrouter_mock, monkeypatch):
+    from llm_batch.poller import Poller
+
+    keys = {"ws1": providers.ProviderCredentials(api_key="k1"),
+            "ws2": providers.ProviderCredentials(api_key="k2")}
+    root = FileStorage(str(tmp_path))
+    for ref in keys:
+        root.for_job(ref).save({"key": ref, "state": "completed", "model": MODEL,
+                                "batch_job_id": f"b-{ref}", "credentials_ref": ref})
+    swept = []
+    monkeypatch.setattr(providers, "_openrouter_orphans",
+                        lambda live, days, *, creds=None: swept.append(creds.api_key) or [])
+    Poller(root, credentials=lambda ref: {"openrouter": keys[ref]}).sweep_orphans()
+    assert sorted(swept) == ["k1", "k2"]

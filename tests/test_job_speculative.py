@@ -152,10 +152,10 @@ def _seed_speculative_sent(tmp_path, key="x", *, deadline, provider="openai"):
 def test_state_a_keeps_waiting_when_time_remains(tmp_path, monkeypatch):
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
     monkeypatch.setattr(job_module.providers, "poll_batch",
-                        lambda h: PollResult(status="pending"))
+                        lambda h, **_: PollResult(status="pending"))
     cancel_called = {"n": 0}
     monkeypatch.setattr(job_module.providers, "cancel",
-                        lambda h: cancel_called.__setitem__("n", cancel_called["n"] + 1))
+                        lambda h, **_: cancel_called.__setitem__("n", cancel_called["n"] + 1))
     handle = _seed_speculative_sent(tmp_path, deadline=(_now() + timedelta(hours=72)).isoformat())
     job = Job(handle)
     assert job.execute() is None
@@ -166,10 +166,10 @@ def test_state_a_keeps_waiting_when_time_remains(tmp_path, monkeypatch):
 def test_state_a_initiates_cancel_when_out_of_time(tmp_path, monkeypatch):
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
     monkeypatch.setattr(job_module.providers, "poll_batch",
-                        lambda h: PollResult(status="pending"))
+                        lambda h, **_: PollResult(status="pending"))
     cancel_called = {"n": 0}
     monkeypatch.setattr(job_module.providers, "cancel",
-                        lambda h: cancel_called.__setitem__("n", cancel_called["n"] + 1))
+                        lambda h, **_: cancel_called.__setitem__("n", cancel_called["n"] + 1))
     handle = _seed_speculative_sent(tmp_path, deadline=(_now() + timedelta(hours=1)).isoformat())
     job = Job(handle)
     assert job.execute() is None
@@ -180,10 +180,10 @@ def test_state_a_initiates_cancel_when_out_of_time(tmp_path, monkeypatch):
 
 def test_state_a_completed_returns_result(tmp_path, monkeypatch):
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
-    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: None)
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h, **_: None)
     monkeypatch.setattr(
         job_module.providers, "poll_batch",
-        lambda h: PollResult(status="completed", texts=["done"],
+        lambda h, **_: PollResult(status="completed", texts=["done"],
                              usage={}, cost={}, output_file_id="of1"))
     handle = _seed_speculative_sent(tmp_path, deadline=(_now() + timedelta(hours=1)).isoformat())
     job = Job(handle)
@@ -194,9 +194,9 @@ def test_state_a_completed_returns_result(tmp_path, monkeypatch):
 def test_state_a_cancel_transient_stays_sent(tmp_path, monkeypatch):
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
     monkeypatch.setattr(job_module.providers, "poll_batch",
-                        lambda h: PollResult(status="pending"))
+                        lambda h, **_: PollResult(status="pending"))
 
-    def boom(h):
+    def boom(h, **_):
         raise job_module.providers.TransientProviderError("rate limited")
 
     monkeypatch.setattr(job_module.providers, "cancel", boom)
@@ -225,10 +225,10 @@ def _seed_cancel_requested(tmp_path, key="x", *, cancel_requested_at, provider="
 
 def test_state_b_completed_salvages_batch_result(tmp_path, monkeypatch):
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
-    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: None)
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h, **_: None)
     monkeypatch.setattr(
         job_module.providers, "poll_batch",
-        lambda h: PollResult(status="completed", texts=["batched"],
+        lambda h, **_: PollResult(status="completed", texts=["batched"],
                              usage={}, cost={}, output_file_id="of1"))
     handle = _seed_cancel_requested(tmp_path, cancel_requested_at=_now().isoformat())
     job = Job(handle)
@@ -239,9 +239,9 @@ def test_state_b_completed_salvages_batch_result(tmp_path, monkeypatch):
 
 def test_state_b_cancelled_reissues_interactively(tmp_path, monkeypatch):
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
-    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: None)
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h, **_: None)
     monkeypatch.setattr(job_module.providers, "poll_batch",
-                        lambda h: PollResult(status="canceled"))
+                        lambda h, **_: PollResult(status="canceled"))
     monkeypatch.setattr(
         job_module.providers, "complete",
         lambda model, messages, **kw: CompletionResult(
@@ -258,7 +258,7 @@ def test_state_b_cancelled_reissues_interactively(tmp_path, monkeypatch):
 def test_state_b_still_queued_keeps_waiting(tmp_path, monkeypatch):
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
     monkeypatch.setattr(job_module.providers, "poll_batch",
-                        lambda h: PollResult(status="pending"))
+                        lambda h, **_: PollResult(status="pending"))
     handle = _seed_cancel_requested(tmp_path, cancel_requested_at=_now().isoformat())
     job = Job(handle)
     assert job.execute() is None
@@ -267,9 +267,9 @@ def test_state_b_still_queued_keeps_waiting(tmp_path, monkeypatch):
 
 def test_state_b_timeout_forces_interactive(tmp_path, monkeypatch):
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
-    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: None)
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h, **_: None)
     monkeypatch.setattr(job_module.providers, "poll_batch",
-                        lambda h: PollResult(status="pending"))
+                        lambda h, **_: PollResult(status="pending"))
     monkeypatch.setattr(
         job_module.providers, "complete",
         lambda model, messages, **kw: CompletionResult(
@@ -286,7 +286,7 @@ def test_state_b_timeout_forces_interactive(tmp_path, monkeypatch):
 def test_state_b_reissue_transient_stays_cancel_requested(tmp_path, monkeypatch):
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
     monkeypatch.setattr(job_module.providers, "poll_batch",
-                        lambda h: PollResult(status="canceled"))
+                        lambda h, **_: PollResult(status="canceled"))
 
     def boom(model, messages, **kw):
         raise job_module.providers.TransientProviderError("rate limited")
@@ -301,7 +301,7 @@ def test_state_b_reissue_transient_stays_cancel_requested(tmp_path, monkeypatch)
 def test_full_speculative_lifecycle_cancel_then_reissue(tmp_path, monkeypatch):
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: "openai")
     monkeypatch.setattr(job_module.providers, "provider_supports_cancel", lambda p: True)
-    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: None)
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h, **_: None)
     monkeypatch.setattr(
         job_module.providers, "submit_batch",
         lambda model, requests, **kw: BatchHandle(
@@ -311,9 +311,9 @@ def test_full_speculative_lifecycle_cancel_then_reissue(tmp_path, monkeypatch):
     state = {"phase": "pending"}
     monkeypatch.setattr(
         job_module.providers, "poll_batch",
-        lambda h: PollResult(status=state["phase"]))
+        lambda h, **_: PollResult(status=state["phase"]))
     monkeypatch.setattr(job_module.providers, "cancel",
-                        lambda h: state.__setitem__("phase", "canceled"))
+                        lambda h, **_: state.__setitem__("phase", "canceled"))
     monkeypatch.setattr(
         job_module.providers, "complete",
         lambda model, messages, **kw: CompletionResult(
