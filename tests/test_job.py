@@ -26,7 +26,7 @@ def fake_providers(monkeypatch):
                                 usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                                 cost={"charged_usd": 0.02, "interactive_usd": 0.02, "saved_usd": 0.0})
 
-    def cleanup(handle):
+    def cleanup(handle, **_):
         calls["cleanup"].append(handle.batch_job_id)
 
     monkeypatch.setattr(job_module.providers, "submit_batch", submit_batch)
@@ -71,7 +71,7 @@ def test_batch_submit_returns_none_and_persists_sent(tmp_path, fake_providers):
 
 def test_execute_is_idempotent_one_submit(tmp_path, fake_providers, monkeypatch):
     monkeypatch.setattr(job_module.providers, "poll_batch",
-                        lambda h: PollResult(status="pending"))
+                        lambda h, **_: PollResult(status="pending"))
     job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
               model="gpt-4o", mode="batch")
     assert job.execute() is None      # submits
@@ -81,7 +81,7 @@ def test_execute_is_idempotent_one_submit(tmp_path, fake_providers, monkeypatch)
 
 
 def test_batch_poll_completed_single(tmp_path, fake_providers, monkeypatch):
-    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="completed", texts=["the text"],
         usage={"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
         cost={"charged_usd": 0.01, "interactive_usd": 0.02, "saved_usd": 0.01},
@@ -98,7 +98,7 @@ def test_batch_poll_completed_single(tmp_path, fake_providers, monkeypatch):
 
 
 def test_batch_poll_completed_bundle_returns_list(tmp_path, fake_providers, monkeypatch):
-    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="completed", texts=["p1", "p2"],
         usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         cost={"charged_usd": 0.0, "interactive_usd": 0.0, "saved_usd": 0.0},
@@ -111,13 +111,13 @@ def test_batch_poll_completed_bundle_returns_list(tmp_path, fake_providers, monk
 
 
 def test_completed_is_terminal_no_api(tmp_path, fake_providers, monkeypatch):
-    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="completed", texts=["done"], usage={}, cost={}, output_file_id="o"))
     handle = _handle(tmp_path)
     job = Job(handle, "x", messages=[{"role": "user", "content": "hi"}], model="gpt-4o", mode="batch")
     job.execute(); job.execute()                      # -> COMPLETED
     # a fresh Job loaded from the same storage returns the stored result, no poll
-    def boom(h):
+    def boom(h, **_):
         raise AssertionError("must not poll a completed job")
     monkeypatch.setattr(job_module.providers, "poll_batch", boom)
     reloaded = Job(FileStorage(str(tmp_path)).for_job("x"), "x")
@@ -126,7 +126,7 @@ def test_completed_is_terminal_no_api(tmp_path, fake_providers, monkeypatch):
 
 
 def test_transient_poll_keeps_sent_and_bumps_attempts(tmp_path, fake_providers, monkeypatch):
-    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="transient_error", error_message="429"))
     job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
               model="gpt-4o", mode="batch")
@@ -137,7 +137,7 @@ def test_transient_poll_keeps_sent_and_bumps_attempts(tmp_path, fake_providers, 
 
 
 def test_provider_failed_makes_job_failed_and_sticky(tmp_path, fake_providers, monkeypatch):
-    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="failed", error_message="batch expired", output_file_id=None))
     job = Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
               model="gpt-4o", mode="batch")
@@ -156,7 +156,7 @@ def test_resume_across_instances(tmp_path, fake_providers, monkeypatch):
     Job(_handle(tmp_path), "x", messages=[{"role": "user", "content": "hi"}],
         model="gpt-4o", mode="batch").execute()
     # Second process: poll-only reconstruction (no messages), completes.
-    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="completed", texts=["resumed"], usage={}, cost={}, output_file_id="o"))
     resumed = Job(FileStorage(str(tmp_path)).for_job("x"), key=None)
     assert resumed.execute() == "resumed"
@@ -166,10 +166,10 @@ def test_resume_across_instances(tmp_path, fake_providers, monkeypatch):
 def test_persist_happens_before_cleanup(tmp_path, fake_providers, monkeypatch):
     order = []
     handle = _handle(tmp_path)
-    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="completed", texts=["t"], usage={}, cost={}, output_file_id="o"))
     monkeypatch.setattr(job_module.providers, "cleanup",
-                        lambda h: order.append("cleanup"))
+                        lambda h, **_: order.append("cleanup"))
     job = Job(handle, "x", messages=[{"role": "user", "content": "hi"}],
               model="gpt-4o", mode="batch")
     job.execute()
@@ -190,7 +190,7 @@ def test_usage_property_returns_zero_dict_when_not_completed(tmp_path, fake_prov
 
 
 def test_usage_property_returns_stored_usage_when_completed(tmp_path, fake_providers, monkeypatch):
-    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="completed", texts=["the text"],
         usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
         cost={"charged_usd": 0.01, "interactive_usd": 0.02, "saved_usd": 0.01},
@@ -218,7 +218,7 @@ def test_cost_property_returns_zero_dict_when_not_completed(tmp_path, fake_provi
 
 
 def test_cost_property_returns_stored_cost_when_completed(tmp_path, fake_providers, monkeypatch):
-    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="completed", texts=["the text"],
         usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
         cost={"charged_usd": 0.01, "interactive_usd": 0.02, "saved_usd": 0.01},
@@ -247,7 +247,7 @@ def test_finish_reason_property_none_before_completion(tmp_path, fake_providers)
 def test_finish_reason_property_returns_stored_value_after_batch_completion(
     tmp_path, fake_providers, monkeypatch
 ):
-    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="completed", texts=["the text"],
         usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
         cost={"charged_usd": 0.01, "interactive_usd": 0.02, "saved_usd": 0.01},
@@ -302,7 +302,7 @@ def test_finish_reason_none_for_one_request_bundle_via_batch_completion(
     # populate a scalar finish_reason here, mimicking the provider layer -- but
     # this job is still a bundle (_is_bundle is True), so finish_reason must stay
     # None for consistency with the interactive completion paths.
-    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="completed", texts=["the text"],
         usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
         cost={"charged_usd": 0.01, "interactive_usd": 0.02, "saved_usd": 0.01},
@@ -376,7 +376,7 @@ def test_interactive_bundle_items_keep_per_request_finish_reason(tmp_path, fake_
 def test_batch_bundle_items_are_persisted(tmp_path, fake_providers, monkeypatch):
     items = [{"text": "p1", "finish_reason": "stop", "usage": {}, "cost": {}},
              {"text": "p2", "finish_reason": "length", "usage": {}, "cost": {}}]
-    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h: PollResult(
+    monkeypatch.setattr(job_module.providers, "poll_batch", lambda h, **_: PollResult(
         status="completed", texts=["p1", "p2"], usage={}, cost={}, output_file_id="o", items=items))
     job = Job(_handle(tmp_path), "x", requests=[[{"role": "user", "content": "a"}],
                                                 [{"role": "user", "content": "b"}]],

@@ -24,9 +24,10 @@ def main(argv=None) -> int:
     if args.command == "poll":
         backend = FileStorage(args.state_dir)
         poller = Poller(backend, max_batch_age_days=args.max_batch_age_days)
-        poller.poll_all()
+        result = poller.poll_all()
         if args.sweep_orphans is not None:
             poller.sweep_orphans(older_than_days=args.sweep_orphans)
-        return 0
+        # Jobs that raised are logged and retried next run; a non-zero exit keeps cron/CI aware.
+        return 1 if result["errors"] else 0
 
     return 1

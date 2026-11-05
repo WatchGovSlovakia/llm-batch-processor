@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 import litellm
@@ -62,6 +62,52 @@ _TRANSIENT_NAME_FRAGMENTS = (
     "timeout", "ratelimit", "serviceunavailable",
     "apiconnection", "internalserver", "overloaded",
 )
+
+
+@dataclass(frozen=True)
+class ProviderCredentials:
+    """API credentials for one provider, passed by the caller instead of read from the environment.
+
+    Never persisted: jobs keep only provider-side ids in their state, so a resumed job needs the
+    credentials again. ``None`` fields fall back to the provider's environment variables.
+    """
+
+    api_key: str | None = field(default=None, repr=False)  # keep keys out of logs and tracebacks
+    api_base: str | None = None
+
+    # One rule for "credentials vs. environment": a set (non-empty) field wins, else the env var.
+
+    def resolved(self, env_key: str, env_base: str, default_base: str | None = None):
+        """(api_key, api_base) for a call this module makes itself, with environment fallback."""
+        return (self.api_key or os.environ.get(env_key) or None,
+                self.api_base or os.environ.get(env_base) or default_base)
+
+    def litellm_kwargs(self) -> dict:
+        """The set fields as litellm `api_key`/`api_base` (litellm falls back to the env itself)."""
+        return {k: v for k, v in (("api_key", self.api_key), ("api_base", self.api_base)) if v}
+
+
+def _creds_for(credentials, provider: str):
+    """The ProviderCredentials of `provider` in a {provider: ProviderCredentials} mapping, or None."""
+    return (credentials or {}).get(provider)
+
+
+# Providers whose batch path (submit, poll, cancel, cleanup, orphan sweep) honours
+# ProviderCredentials. The others go through litellm's file/batch calls or SDK clients
+# that read only the environment, so credentials for them are refused rather than
+# silently ignored (which would bill whatever account the env key belongs to).
+_BATCH_CREDENTIALS = {"openrouter"}
+
+
+def _batch_creds(credentials, provider: str):
+    """`provider`'s credentials for a batch operation; ValueError if its batch path can't use them."""
+    creds = _creds_for(credentials, provider)
+    if creds is not None and provider not in _BATCH_CREDENTIALS:
+        raise ValueError(
+            f"credentials for {provider!r} are not supported on the batch path yet "
+            f"(only {', '.join(sorted(_BATCH_CREDENTIALS))}); set its environment variables "
+            f"or use mode='interactive'")
+    return creds
 
 
 @dataclass
@@ -264,16 +310,18 @@ def _build_jsonl(model: str, requests: list, **kw) -> str:
     return "\n".join(lines) + "\n"
 
 
-def submit_batch(model: str, requests: list, **kw) -> BatchHandle:
+def submit_batch(model: str, requests: list, *, credentials=None, **kw) -> BatchHandle:
     """Upload a JSONL of all requests and create a batch job.
 
     `requests` is a list of message-lists (a single-request job passes a
     one-element list). Extra kwargs (response_format, tools, temperature, ...)
-    are forwarded into each request body.
+    are forwarded into each request body. `credentials` ({provider: ProviderCredentials})
+    is used instead of the environment (OpenRouter only; ValueError for other providers).
     """
     provider = provider_of(model)
+    creds = _batch_creds(credentials, provider)
     if provider == "openrouter":
-        return _submit_openrouter(model, requests, **kw)
+        return _submit_openrouter(model, requests, creds=creds, **kw)
     try:
         jsonl = _build_jsonl(model, requests, **kw)
         file_obj = litellm.create_file(
@@ -301,7 +349,7 @@ def submit_batch(model: str, requests: list, **kw) -> BatchHandle:
     )
 
 
-def cancel(handle: BatchHandle) -> None:
+def cancel(handle: BatchHandle, *, credentials=None) -> None:
     """Initiate cancellation of a batch job and return immediately.
 
     Delegates to litellm for all providers (OpenAI/Azure/Vertex). Does NOT wait
@@ -309,6 +357,7 @@ def cancel(handle: BatchHandle) -> None:
     (the job transitions through CANCEL_REQUESTED). Transient errors are wrapped so
     the caller can leave the job in place and retry on the next scheduled poll.
     """
+    _batch_creds(credentials, handle.provider)  # refuse rather than cancel with the env key
     if handle.provider == "openrouter":
         raise NotImplementedError("the OpenRouter Batch API has no cancel endpoint")
     try:
@@ -322,8 +371,15 @@ def cancel(handle: BatchHandle) -> None:
         raise
 
 
-def complete(model: str, messages: list, **kw) -> CompletionResult:
-    """Interactive path: one immediate completion with usage + cost."""
+def complete(model: str, messages: list, *, credentials=None, **kw) -> CompletionResult:
+    """Interactive path: one immediate completion with usage + cost.
+
+    The provider's ProviderCredentials in `credentials` go to litellm as `api_key`/`api_base`;
+    an `api_key`/`api_base` passed explicitly in `kw` takes precedence over them.
+    """
+    creds = _creds_for(credentials, provider_of(model))
+    if creds is not None:
+        kw = {**creds.litellm_kwargs(), **kw}
     try:
         response = litellm.completion(model=model, messages=messages, **kw)
     except Exception as exc:
@@ -370,7 +426,7 @@ _CANCELED_STATUSES = {"cancelled", "canceled"}
 _FAILED_STATUSES = {"failed", "expired"}
 
 
-def poll_batch(handle: BatchHandle) -> PollResult:
+def poll_batch(handle: BatchHandle, *, credentials=None) -> PollResult:
     """Poll one batch job once and classify the outcome.
 
     Returns a PollResult with status pending | completed | failed | transient_error | canceled.
@@ -378,8 +434,9 @@ def poll_batch(handle: BatchHandle) -> PollResult:
     polling (spec §8.1).
     """
     provider = handle.provider
+    creds = _batch_creds(credentials, provider)
     if provider == "openrouter":
-        return _poll_openrouter(handle)
+        return _poll_openrouter(handle, creds=creds)
     try:
         batch = litellm.retrieve_batch(
             batch_id=handle.batch_job_id, custom_llm_provider=provider)
@@ -467,19 +524,25 @@ def _completed(handle: BatchHandle, items_by_id: dict, output_file_id: str | Non
         output_file_id=output_file_id, finish_reason=finish_reason, items=items)
 
 
-def cleanup(handle: BatchHandle) -> None:
+def cleanup(handle: BatchHandle, *, credentials=None) -> None:
     """Delete provider-side batch artifacts. Best-effort; never raises.
 
     Per spec §7: OpenAI deletes file objects (quota); Vertex deletes GCS objects
     (billing); OpenRouter deletes the batch (stored requests and results, which
     otherwise expire after 30 days); Gemini-API and Anthropic auto-expire so this
-    is a no-op.
+    is a no-op. Skipped (with a warning) when `credentials` hold keys for a provider
+    whose batch path can't use them, rather than deleting with the environment's account.
     """
     provider = handle.provider
+    try:
+        creds = _batch_creds(credentials, provider)
+    except ValueError as exc:
+        logger.warning("cleanup of batch %s skipped: %s", handle.batch_job_id, exc)
+        return
     if provider == "openrouter":
         try:
             # Allowed on terminal batches only; a still-running one answers 409.
-            _openrouter_http("DELETE", f"/batches/{handle.batch_job_id}")
+            _openrouter_http("DELETE", f"/batches/{handle.batch_job_id}", creds=creds)
         except Exception:
             pass  # best-effort: result is already persisted before we get here
     elif provider == "openai":
@@ -518,16 +581,23 @@ def _delete_gcs_object(uri: str) -> None:
         bucket.blob(path).delete()
 
 
-def cleanup_orphans(provider: str, live_ids: set, older_than_days: int) -> list[str]:
+def cleanup_orphans(provider: str, live_ids: set, older_than_days: int, *,
+                    credentials=None) -> list[str]:
     """Best-effort sweep of provider-side files with no live local state.
 
     Implemented for OpenAI (file objects) via the openai SDK and for OpenRouter
     (terminal batches); a no-op for other providers (Vertex/Anthropic/Gemini),
     where listing is provider-specific or unnecessary. Returns the list of
-    deleted ids. Never raises.
+    deleted ids. Never raises. Skipped (with a warning) when `credentials` hold keys
+    for a provider whose sweep can't use them: the environment's account may be another one.
     """
+    try:
+        creds = _batch_creds(credentials, provider)
+    except ValueError as exc:
+        logger.warning("orphan sweep for %s skipped: %s", provider, exc)
+        return []
     if provider == "openrouter":
-        return _openrouter_orphans(live_ids, older_than_days)
+        return _openrouter_orphans(live_ids, older_than_days, creds=creds)
     if provider != "openai":
         return []
     try:
@@ -567,16 +637,16 @@ _OPENROUTER_TERMINAL = ("completed", "failed", "expired", "cancelled")
 
 
 def _openrouter_http(method: str, path: str, *, json: dict | None = None,
-                     params=None) -> dict:
+                     params=None, creds: ProviderCredentials | None = None) -> dict:
     """One OpenRouter API call; returns the JSON body.
 
     Raises OpenRouterAPIError on a non-2xx status (classified by _is_transient)
     and TransientProviderError on a network failure.
     """
-    key = os.environ.get("OPENROUTER_API_KEY")
+    key, base = (creds or ProviderCredentials()).resolved(
+        "OPENROUTER_API_KEY", "OPENROUTER_API_BASE", _OPENROUTER_DEFAULT_BASE)
     if not key:
         raise OpenRouterAPIError(401, "OPENROUTER_API_KEY is not set")
-    base = os.environ.get("OPENROUTER_API_BASE") or _OPENROUTER_DEFAULT_BASE
     try:
         with httpx.Client(transport=_OPENROUTER_TRANSPORT, timeout=_OPENROUTER_TIMEOUT) as client:
             response = client.request(method, base.rstrip("/") + path, json=json, params=params,
@@ -592,7 +662,7 @@ def _openrouter_http(method: str, path: str, *, json: dict | None = None,
     raise OpenRouterAPIError(response.status_code, message)
 
 
-def _submit_openrouter(model: str, requests: list, **kw) -> BatchHandle:
+def _submit_openrouter(model: str, requests: list, *, creds=None, **kw) -> BatchHandle:
     """Create an OpenRouter batch with the requests inline (no file upload)."""
     payload = {
         # OpenRouter reads the body as a stream: `requests` must come last.
@@ -603,7 +673,7 @@ def _submit_openrouter(model: str, requests: list, **kw) -> BatchHandle:
                      for i, messages in enumerate(requests)],
     }
     try:
-        batch = _openrouter_http("POST", "/batches", json=payload)
+        batch = _openrouter_http("POST", "/batches", json=payload, creds=creds)
     except Exception as exc:
         if _is_transient(exc):
             raise TransientProviderError(str(exc)) from exc
@@ -612,10 +682,10 @@ def _submit_openrouter(model: str, requests: list, **kw) -> BatchHandle:
                        input_file_id=None, n_requests=len(requests))
 
 
-def _poll_openrouter(handle: BatchHandle) -> PollResult:
+def _poll_openrouter(handle: BatchHandle, *, creds=None) -> PollResult:
     """Poll an OpenRouter batch; a terminal batch carries its results inline."""
     try:
-        batch = _openrouter_http("GET", f"/batches/{handle.batch_job_id}")
+        batch = _openrouter_http("GET", f"/batches/{handle.batch_job_id}", creds=creds)
     except Exception as exc:
         status_code = getattr(exc, "status_code", None)
         # 404 also answers a GET sent right after the create (live probe 2026-10-24),
@@ -676,7 +746,7 @@ def _openrouter_costs(results: list, batch_usage: dict | None) -> dict:
     return {cid: total_usd * n / total_tokens for cid, n in tokens.items()}
 
 
-def _openrouter_orphans(live_ids: set, older_than_days: int) -> list[str]:
+def _openrouter_orphans(live_ids: set, older_than_days: int, *, creds=None) -> list[str]:
     """Delete terminal OpenRouter batches older than the cutoff with no live state.
 
     Every API key in a workspace sees (and can delete) the same batches.
@@ -686,13 +756,13 @@ def _openrouter_orphans(live_ids: set, older_than_days: int) -> list[str]:
         params = [("status", s) for s in _OPENROUTER_TERMINAL]
         params += [("created_before", int(time.time() - older_than_days * 86400)), ("limit", 100)]
         while True:
-            page = _openrouter_http("GET", "/batches",
+            page = _openrouter_http("GET", "/batches", creds=creds,
                                     params=params + ([("after", after)] if after else []))
             for batch in page.get("data", []):
                 if batch["id"] in live_ids:
                     continue
                 try:
-                    _openrouter_http("DELETE", f"/batches/{batch['id']}")
+                    _openrouter_http("DELETE", f"/batches/{batch['id']}", creds=creds)
                     deleted.append(batch["id"])
                 except Exception:
                     pass

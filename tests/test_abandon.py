@@ -14,8 +14,8 @@ def prov(monkeypatch):
     monkeypatch.setattr(job_module.providers, "provider_of", lambda m: m.split("/")[0])
     monkeypatch.setattr(job_module.providers, "provider_supports_cancel",
                         lambda p: p in ("openai", "azure", "vertex_ai"))
-    monkeypatch.setattr(job_module.providers, "cancel", lambda h: calls["cancel"].append(h))
-    monkeypatch.setattr(job_module.providers, "cleanup", lambda h: calls["cleanup"].append(h))
+    monkeypatch.setattr(job_module.providers, "cancel", lambda h, **_: calls["cancel"].append(h))
+    monkeypatch.setattr(job_module.providers, "cleanup", lambda h, **_: calls["cleanup"].append(h))
     monkeypatch.setattr(
         job_module.providers, "submit_batch",
         lambda model, requests, **kw: BatchHandle(
@@ -85,7 +85,7 @@ def test_abandon_noop_for_not_sent_completed_failed(tmp_path, prov):
 def test_abandon_cancel_error_propagates_and_keeps_state(tmp_path, prov, monkeypatch):
     job = _sent_job(tmp_path)
 
-    def boom(handle):
+    def boom(handle, **_):
         raise TransientProviderError("rate limited")
     monkeypatch.setattr(job_module.providers, "cancel", boom)
     with pytest.raises(TransientProviderError):

@@ -133,6 +133,39 @@ without it fails at submit with `400`. Research and probe results are in
 
 - **Env:** `OPENROUTER_API_KEY` (required). `OPENROUTER_API_BASE` is optional and
   defaults to `https://openrouter.ai/api/v1`.
+- **Credentials from the caller:** a host that keeps keys elsewhere (or runs jobs for
+  several keys) passes them instead of the environment:
+
+  ```python
+  from llm_batch import FileStorage, Pipeline, Poller, ProviderCredentials
+
+  creds = {"openrouter": ProviderCredentials(api_key=key, api_base=None)}
+  pipeline = Pipeline("./state", mode="batch", credentials=creds,
+                      credentials_ref="settings-42")   # also Job(...)
+
+  # One poller for jobs submitted under different keys: resolve them per job.
+  poller = Poller(FileStorage("./state"),
+                  credentials=lambda ref: {"openrouter": ProviderCredentials(api_key=lookup(ref))})
+  ```
+
+  They reach every OpenRouter call (submit, poll, delete, orphan sweep) and the
+  interactive litellm path (`api_key`/`api_base`). They are **never persisted**: the
+  job state holds only provider ids and `credentials_ref` (your opaque id for the key,
+  e.g. a settings or workspace id), so a resumed job needs `credentials=` again.
+  `Poller(credentials=...)` takes a fixed map or a callable `ref -> map`, called with
+  each job's `credentials_ref` (`None` for jobs without one); `sweep_orphans()` then
+  sweeps once per distinct key among the jobs it knows. Precedence: a set field, else
+  the environment variables above; an `api_key`/`api_base` passed explicitly as a
+  litellm kwarg wins over the credentials.
+- **Batch credentials are OpenRouter-only for now:** `complete()` honours credentials
+  for every provider, but batch submit/poll/cancel for other providers (litellm file
+  and batch calls) read only the environment, so credentials for them raise
+  `ValueError` instead of being silently ignored. Cleanup and the orphan sweep skip
+  such a provider with a warning rather than deleting with the environment's account.
+- **Poll errors:** `Poller.poll_all()` returns `{"advanced": [...], "errors": [...]}`.
+  A job that raises (e.g. a missing or revoked key, `401`) is logged, listed under
+  `errors` and left as it is for the next run; the other jobs are still polled.
+  `llm-batch poll` then exits with `1`.
 - **Cost:** `cost_source="provider"`. `charged_usd` is what OpenRouter billed
   (the batch's `usage.cost`), split across requests by token share. `interactive_usd`
   is estimated as `charged / providers.BATCH_RATES["openrouter"]` (0.5, OpenRouter's

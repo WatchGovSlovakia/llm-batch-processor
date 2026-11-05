@@ -61,7 +61,7 @@ _PERSISTED_FIELDS = (
     "actual_mode", "response", "usage", "cost", "finish_reason", "error_message",
     "poll_attempts", "rerun_cmd", "cleanup_provider_files",
     "fallback_strategy", "payload", "litellm_kwargs", "cancel_requested_at", "items",
-    "hosted_images",
+    "hosted_images", "credentials_ref",
 )
 
 
@@ -91,7 +91,7 @@ class Job:
                  fallback_strategy="conservative", poll_interval_hours=1.0,
                  interactive_runtime_estimate_hours=0.25,
                  cancel_margin_hours=None, cancel_resolution_timeout_hours=None,
-                 image_host=None, **litellm_kwargs):
+                 image_host=None, credentials=None, credentials_ref=None, **litellm_kwargs):
         if messages is not None and requests is not None:
             raise ValueError("pass either messages= or requests=, not both")
 
@@ -118,6 +118,11 @@ class Job:
         self._cancel_margin_h = cancel_margin_hours
         self._cancel_resolution_timeout_h = cancel_resolution_timeout_hours
         self._image_host = image_host
+        # {provider: ProviderCredentials}; deliberately not persisted (see providers.ProviderCredentials).
+        self._credentials = credentials
+        # Caller's opaque id for those credentials (e.g. a workspace or settings id), persisted so
+        # a Poller can resolve the right key per job. Never the key itself.
+        self._credentials_ref = credentials_ref
         self._state: dict = {}
 
         if self._storage.load():
@@ -136,6 +141,8 @@ class Job:
             if self._payload is None and self._state.get("payload") is not None:
                 self._payload = self._state.get("payload")
                 self._is_bundle = bool(self._state.get("bundle"))
+            if self._state.get("credentials_ref") is not None:
+                self._credentials_ref = self._state.get("credentials_ref")
             if not self._kw and self._state.get("litellm_kwargs"):
                 self._kw = dict(self._state.get("litellm_kwargs"))
 
@@ -144,6 +151,10 @@ class Job:
     @property
     def state(self) -> str:
         return self._state.get("state", self.NOT_SENT)
+
+    @property
+    def credentials_ref(self) -> str | None:
+        return self._credentials_ref
 
     @property
     def result(self):
@@ -229,7 +240,7 @@ class Job:
         handle = self._batch_handle()
         cancelled = state == self.CANCEL_REQUESTED  # cancel already issued
         if state == self.SENT and providers.provider_supports_cancel(handle.provider):
-            providers.cancel(handle)
+            providers.cancel(handle, credentials=self._credentials)
             cancelled = True
         self._mark_failed(reason, handle, self._state.get("output_file_id"))
         return cancelled
@@ -320,6 +331,7 @@ class Job:
             "cancel_requested_at": None,
             "items": None,
             "hosted_images": None,
+            "credentials_ref": self._credentials_ref,
         }
 
     def _save(self) -> None:
@@ -352,7 +364,7 @@ class Job:
         last_finish_reason = None
         try:
             for messages in self._payload:
-                cr = providers.complete(self._model, messages, **self._kw)
+                cr = providers.complete(self._model, messages, credentials=self._credentials, **self._kw)
                 texts.append(cr.text)
                 items.append(providers.completion_item(cr))
                 _accumulate(usage, cr.usage)
@@ -376,7 +388,7 @@ class Job:
         if self._image_host is not None and providers.batch_needs_hosted_images(self._provider()):
             payload, hosted = images.externalize_images(self._payload, self._image_host)
         try:
-            handle = providers.submit_batch(self._model, payload, **self._kw)
+            handle = providers.submit_batch(self._model, payload, credentials=self._credentials, **self._kw)
         except BaseException as exc:
             images.release_images(self._image_host, hosted)
             if isinstance(exc, providers.TransientProviderError):
@@ -414,7 +426,7 @@ class Job:
         return self._poll_conservative(handle)
 
     def _poll_conservative(self, handle):
-        result = providers.poll_batch(handle)
+        result = providers.poll_batch(handle, credentials=self._credentials)
 
         if result.status in ("pending", "transient_error"):
             self._state["poll_attempts"] = self._state.get("poll_attempts", 0) + 1
@@ -442,13 +454,13 @@ class Job:
         if self._cleanup:
             handle.output_file_id = result.output_file_id
             try:
-                providers.cleanup(handle)
+                providers.cleanup(handle, credentials=self._credentials)
             except Exception:
                 pass  # best-effort; result already durably saved
         return response
 
     def _poll_speculative(self, handle):
-        result = providers.poll_batch(handle)
+        result = providers.poll_batch(handle, credentials=self._credentials)
 
         if result.status == "completed":
             return self._finish_completed(handle, result)
@@ -475,7 +487,7 @@ class Job:
         # wait for it to take effect — the next scheduled poll resolves it.
         # Safe to re-cancel if we crash before the save below: a repeat cancel_batch on an already-cancelling job is idempotent (no fee).
         try:
-            providers.cancel(handle)
+            providers.cancel(handle, credentials=self._credentials)
         except providers.TransientProviderError:
             self._save()  # cancel failed transiently; retry next poll, stay SENT
             return None
@@ -496,7 +508,7 @@ class Job:
 
     def _poll_cancel(self):
         handle = self._batch_handle()
-        result = providers.poll_batch(handle)
+        result = providers.poll_batch(handle, credentials=self._credentials)
 
         if result.status == "completed":
             # Finished before the cancel took effect → salvage the batch result.
@@ -529,7 +541,7 @@ class Job:
         last_finish_reason = None
         try:
             for messages in self._payload:
-                cr = providers.complete(self._model, messages, **self._kw)
+                cr = providers.complete(self._model, messages, credentials=self._credentials, **self._kw)
                 texts.append(cr.text)
                 items.append(providers.completion_item(cr))
                 _accumulate(usage, cr.usage)
@@ -549,7 +561,7 @@ class Job:
         self._release_images()
         if self._cleanup:
             try:
-                providers.cleanup(handle)  # remove the (cancelled) batch artifacts
+                providers.cleanup(handle, credentials=self._credentials)  # remove the (cancelled) batch artifacts
             except Exception:
                 pass
         return response
@@ -566,7 +578,7 @@ class Job:
             if output_file_id:
                 handle.output_file_id = output_file_id
             try:
-                providers.cleanup(handle)
+                providers.cleanup(handle, credentials=self._credentials)
             except Exception:
                 pass
 
