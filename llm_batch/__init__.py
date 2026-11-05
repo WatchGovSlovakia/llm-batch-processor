@@ -5,6 +5,7 @@ Public API:
     FileStorage, PostgresStorage     — storage backends
     ImageHost, MongoImageHost, S3ImageHost — image hosting for OpenRouter batch
     BatchJobFailed, TransientProviderError, OpenRouterAPIError  — errors
+    ProviderCredentials              — per-provider API key / base passed by the caller
 """
 
 from llm_batch.errors import BatchJobFailed, OpenRouterAPIError, TransientProviderError
@@ -12,6 +13,7 @@ from llm_batch.images import ImageHost, MongoImageHost, S3ImageHost
 from llm_batch.job import Job
 from llm_batch.pipeline import Pipeline
 from llm_batch.poller import Poller
+from llm_batch.providers import ProviderCredentials
 from llm_batch.storage.file import FileStorage
 from llm_batch.storage.postgres import PostgresStorage
 
@@ -27,4 +29,5 @@ __all__ = [
     "BatchJobFailed",
     "TransientProviderError",
     "OpenRouterAPIError",
+    "ProviderCredentials",
 ]

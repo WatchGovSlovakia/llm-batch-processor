@@ -26,10 +26,12 @@ class FakeOpenRouter:
 
     def __init__(self):
         self.calls = []
+        self.creds = []
         self.routes = {}
 
-    def __call__(self, method, path, *, json=None, params=None):
+    def __call__(self, method, path, *, json=None, params=None, creds=None):
         self.calls.append((method, path, json, params))
+        self.creds.append(creds)
         try:
             answer = self.routes[(method, path)]
         except KeyError:
@@ -357,3 +359,70 @@ def test_http_helper_requires_api_key(monkeypatch):
     with pytest.raises(providers.OpenRouterAPIError) as info:
         providers._openrouter_http("GET", "/batches/x")
     assert info.value.status_code == 401
+
+
+# --- credentials passed by the caller (not read from the environment, never persisted) ---
+
+def test_http_helper_prefers_passed_credentials_over_env(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["auth"] = request.headers["authorization"]
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "env-key")
+    monkeypatch.setenv("OPENROUTER_API_BASE", "https://env.example/api/v1")
+    monkeypatch.setattr(providers, "_OPENROUTER_TRANSPORT", httpx.MockTransport(handler))
+    creds = providers.ProviderCredentials(api_key="claim-key", api_base="https://fake.example/v1/")
+    providers._openrouter_http("GET", "/batches/x", creds=creds)
+    assert seen == {"auth": "Bearer claim-key", "url": "https://fake.example/v1/batches/x"}
+
+
+def test_http_helper_credentials_without_key_fall_back_to_env(monkeypatch):
+    seen = {}
+    monkeypatch.setenv("OPENROUTER_API_KEY", "env-key")
+    monkeypatch.delenv("OPENROUTER_API_BASE", raising=False)
+    monkeypatch.setattr(providers, "_OPENROUTER_TRANSPORT", httpx.MockTransport(
+        lambda r: seen.setdefault("auth", r.headers["authorization"]) and httpx.Response(200, json={})))
+    providers._openrouter_http("GET", "/batches/x", creds=providers.ProviderCredentials())
+    assert seen["auth"] == "Bearer env-key"
+
+
+def test_credentials_repr_hides_the_key():
+    creds = providers.ProviderCredentials(api_key="secret-key", api_base="https://b")
+    assert "secret-key" not in repr(creds)
+
+
+def test_job_passes_credentials_to_every_call_and_never_persists_them(tmp_path, openrouter_mock):
+    creds = {"openrouter": providers.ProviderCredentials(api_key="claim-key")}
+    openrouter_mock.routes[("POST", "/batches")] = {"id": "batch-1", "status": "validating"}
+    job = Job(FileStorage(str(tmp_path)).for_job("j"), "j", messages=[{"role": "user", "content": "hi"}],
+              model=MODEL, mode="batch", credentials=creds)
+    assert job.execute() is None
+    openrouter_mock.routes[("GET", "/batches/batch-1")] = {
+        "id": "batch-1", "status": "completed", "usage": {"cost": 1e-06},
+        "results": [_result("req-0", "hello")]}
+    openrouter_mock.routes[("DELETE", "/batches/batch-1")] = {"id": "batch-1", "deleted": True}
+    resumed = Job(FileStorage(str(tmp_path)).for_job("j"), "j", credentials=creds)
+    assert resumed.execute() == "hello"
+    assert [c[:2] for c in openrouter_mock.calls] == [
+        ("POST", "/batches"), ("GET", "/batches/batch-1"), ("DELETE", "/batches/batch-1")]
+    assert openrouter_mock.creds == [creds["openrouter"]] * 3
+    assert all("claim-key" not in f.read_text() for f in tmp_path.rglob("*") if f.is_file())
+
+
+def test_interactive_complete_passes_credentials_to_litellm(litellm_mock):
+    from tests.conftest import completion_response
+
+    seen = {}
+
+    def fake_completion(**kw):
+        seen.update(kw)
+        return completion_response("ok")
+
+    litellm_mock.completion = fake_completion
+    creds = {"openrouter": providers.ProviderCredentials(api_key="claim-key", api_base="https://b/v1")}
+    cr = providers.complete(MODEL, [{"role": "user", "content": "hi"}], credentials=creds, temperature=0)
+    assert cr.text == "ok"
+    assert seen["api_key"] == "claim-key" and seen["api_base"] == "https://b/v1" and seen["temperature"] == 0

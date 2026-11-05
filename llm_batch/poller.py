@@ -21,9 +21,11 @@ class Poller:
     hosted images and sweep orphaned ones.
     """
 
-    def __init__(self, backend, *, max_batch_age_days=3, run_cmd=None, image_host=None):
+    def __init__(self, backend, *, max_batch_age_days=3, run_cmd=None, image_host=None,
+                 credentials=None):
         self._backend = backend
         self._image_host = image_host
+        self._credentials = credentials
         self._max_age = timedelta(days=max_batch_age_days)
         self._run = run_cmd if run_cmd is not None else _default_run
 
@@ -39,11 +41,11 @@ class Poller:
             # Staleness only force-fails SENT jobs; a CANCEL_REQUESTED job is
             # bounded instead by its cancel_resolution_timeout (re-issues interactively).
             if state == Job.SENT and self._is_stale(handle):
-                job = Job(handle, image_host=self._image_host)
+                job = Job(handle, image_host=self._image_host, credentials=self._credentials)
                 job.mark_failed(f"stale: no completion within {self._max_age.days}d")
                 continue
 
-            job = Job(handle, image_host=self._image_host)
+            job = Job(handle, image_host=self._image_host, credentials=self._credentials)
             try:
                 job.execute()  # polls once
             except BatchJobFailed:
@@ -88,7 +90,8 @@ class Poller:
         deleted: dict[str, list] = {}
         for provider in provider_set:
             deleted[provider] = providers.cleanup_orphans(
-                provider, live_ids, older_than_days)
+                provider, live_ids, older_than_days,
+                **({"credentials": self._credentials} if self._credentials else {}))
         if self._image_host is not None:
             try:
                 deleted["images"] = self._image_host.delete_orphans(live_images, older_than_days)

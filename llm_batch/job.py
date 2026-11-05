@@ -91,7 +91,7 @@ class Job:
                  fallback_strategy="conservative", poll_interval_hours=1.0,
                  interactive_runtime_estimate_hours=0.25,
                  cancel_margin_hours=None, cancel_resolution_timeout_hours=None,
-                 image_host=None, **litellm_kwargs):
+                 image_host=None, credentials=None, **litellm_kwargs):
         if messages is not None and requests is not None:
             raise ValueError("pass either messages= or requests=, not both")
 
@@ -118,6 +118,9 @@ class Job:
         self._cancel_margin_h = cancel_margin_hours
         self._cancel_resolution_timeout_h = cancel_resolution_timeout_hours
         self._image_host = image_host
+        # {provider: ProviderCredentials}; deliberately not persisted (see providers.ProviderCredentials).
+        # Passed on only when given, so provider stand-ins without the keyword keep working.
+        self._ckw = {"credentials": credentials} if credentials else {}
         self._state: dict = {}
 
         if self._storage.load():
@@ -352,7 +355,7 @@ class Job:
         last_finish_reason = None
         try:
             for messages in self._payload:
-                cr = providers.complete(self._model, messages, **self._kw)
+                cr = providers.complete(self._model, messages, **self._ckw, **self._kw)
                 texts.append(cr.text)
                 items.append(providers.completion_item(cr))
                 _accumulate(usage, cr.usage)
@@ -376,7 +379,7 @@ class Job:
         if self._image_host is not None and providers.batch_needs_hosted_images(self._provider()):
             payload, hosted = images.externalize_images(self._payload, self._image_host)
         try:
-            handle = providers.submit_batch(self._model, payload, **self._kw)
+            handle = providers.submit_batch(self._model, payload, **self._ckw, **self._kw)
         except BaseException as exc:
             images.release_images(self._image_host, hosted)
             if isinstance(exc, providers.TransientProviderError):
@@ -414,7 +417,7 @@ class Job:
         return self._poll_conservative(handle)
 
     def _poll_conservative(self, handle):
-        result = providers.poll_batch(handle)
+        result = providers.poll_batch(handle, **self._ckw)
 
         if result.status in ("pending", "transient_error"):
             self._state["poll_attempts"] = self._state.get("poll_attempts", 0) + 1
@@ -442,13 +445,13 @@ class Job:
         if self._cleanup:
             handle.output_file_id = result.output_file_id
             try:
-                providers.cleanup(handle)
+                providers.cleanup(handle, **self._ckw)
             except Exception:
                 pass  # best-effort; result already durably saved
         return response
 
     def _poll_speculative(self, handle):
-        result = providers.poll_batch(handle)
+        result = providers.poll_batch(handle, **self._ckw)
 
         if result.status == "completed":
             return self._finish_completed(handle, result)
@@ -496,7 +499,7 @@ class Job:
 
     def _poll_cancel(self):
         handle = self._batch_handle()
-        result = providers.poll_batch(handle)
+        result = providers.poll_batch(handle, **self._ckw)
 
         if result.status == "completed":
             # Finished before the cancel took effect → salvage the batch result.
@@ -529,7 +532,7 @@ class Job:
         last_finish_reason = None
         try:
             for messages in self._payload:
-                cr = providers.complete(self._model, messages, **self._kw)
+                cr = providers.complete(self._model, messages, **self._ckw, **self._kw)
                 texts.append(cr.text)
                 items.append(providers.completion_item(cr))
                 _accumulate(usage, cr.usage)
@@ -549,7 +552,7 @@ class Job:
         self._release_images()
         if self._cleanup:
             try:
-                providers.cleanup(handle)  # remove the (cancelled) batch artifacts
+                providers.cleanup(handle, **self._ckw)  # remove the (cancelled) batch artifacts
             except Exception:
                 pass
         return response
@@ -566,7 +569,7 @@ class Job:
             if output_file_id:
                 handle.output_file_id = output_file_id
             try:
-                providers.cleanup(handle)
+                providers.cleanup(handle, **self._ckw)
             except Exception:
                 pass
 

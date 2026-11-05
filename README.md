@@ -133,6 +133,20 @@ without it fails at submit with `400`. Research and probe results are in
 
 - **Env:** `OPENROUTER_API_KEY` (required). `OPENROUTER_API_BASE` is optional and
   defaults to `https://openrouter.ai/api/v1`.
+- **Credentials from the caller:** a host that keeps keys elsewhere (or runs jobs for
+  several keys) passes them instead of the environment:
+
+  ```python
+  from llm_batch import Pipeline, ProviderCredentials
+
+  creds = {"openrouter": ProviderCredentials(api_key=key, api_base=None)}
+  pipeline = Pipeline("./state", mode="batch", credentials=creds)   # also Job(...) and Poller(...)
+  ```
+
+  They reach every OpenRouter call (submit, poll, delete, orphan sweep) and the
+  interactive litellm path (`api_key`/`api_base`). They are **never persisted**: the
+  job state holds only provider ids, so a resumed job needs `credentials=` again. A
+  missing field falls back to the environment variables above.
 - **Cost:** `cost_source="provider"`. `charged_usd` is what OpenRouter billed
   (the batch's `usage.cost`), split across requests by token share. `interactive_usd`
   is estimated as `charged / providers.BATCH_RATES["openrouter"]` (0.5, OpenRouter's
